@@ -1,40 +1,20 @@
 package network.reticulum.lxmf
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.yield
-import org.msgpack.core.MessagePack
-import java.io.ByteArrayOutputStream
-import java.math.BigInteger
-import java.security.MessageDigest
-import java.security.SecureRandom
-import java.util.concurrent.atomic.AtomicReference
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
+import network.reticulum.crypto.Hashes
+import network.reticulum.discovery.Stamper
 
 /**
  * LXMF Stamp Generator and Validator.
  *
- * Implements proof-of-work stamp generation for LXMF messages, matching
- * Python LXMF's LXStamper.py algorithm exactly.
- *
- * The algorithm:
- * 1. Generate workblock using HKDF expansion (3000 rounds for messages, 1000 for propagation)
- * 2. Find a stamp (random 32 bytes) where SHA256(workblock + stamp) has enough leading zeros
- *
- * This implementation uses Kotlin coroutines for parallel stamp search across CPU cores.
- *
- * Ported from Columba's StampGenerator.kt.
+ * Thin facade over rns-core's [Stamper], preserving LXMF-specific constants
+ * (3000/1000 expansion rounds) and the existing API used by [LXMessage].
  */
 object LXStamper {
 
     private const val TAG = "LXStamper"
 
     /** Stamp size in bytes (256 bits) */
-    const val STAMP_SIZE = 32
+    const val STAMP_SIZE = Stamper.STAMP_SIZE
 
     /** Workblock expansion rounds for message stamps */
     const val WORKBLOCK_EXPAND_ROUNDS = 3000
@@ -43,23 +23,18 @@ object LXStamper {
     const val WORKBLOCK_EXPAND_ROUNDS_PN = 1000
 
     /** HKDF output length per round */
-    const val HKDF_OUTPUT_LENGTH = 256
-
-    /** Progress logging interval */
-    private const val PROGRESS_LOG_INTERVAL = 8000
+    const val HKDF_OUTPUT_LENGTH = Stamper.HKDF_OUTPUT_LENGTH
 
     /**
      * Result of stamp generation.
-     *
-     * @property stamp The generated stamp (32 bytes), or null if generation failed
-     * @property value The stamp value (number of leading zero bits)
-     * @property rounds Total rounds tried during generation
      */
     data class StampResult(
         val stamp: ByteArray?,
         val value: Int,
         val rounds: Long
     ) {
+        constructor(r: Stamper.StampResult) : this(r.stamp, r.value, r.rounds)
+
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
             if (javaClass != other?.javaClass) return false
@@ -81,125 +56,12 @@ object LXStamper {
         }
     }
 
-    /**
-     * Generate a workblock for stamp validation.
-     *
-     * Matches Python's stamp_workblock():
-     * ```python
-     * for n in range(expand_rounds):
-     *     workblock += HKDF(length=256, derive_from=material,
-     *                       salt=SHA256(material + msgpack(n)), context=None)
-     * ```
-     *
-     * @param material The material to derive workblock from (typically message hash)
-     * @param expandRounds Number of HKDF expansion rounds
-     * @return The generated workblock
-     */
-    fun generateWorkblock(material: ByteArray, expandRounds: Int = WORKBLOCK_EXPAND_ROUNDS): ByteArray {
-        val output = ByteArrayOutputStream(expandRounds * HKDF_OUTPUT_LENGTH)
+    fun generateWorkblock(material: ByteArray, expandRounds: Int = WORKBLOCK_EXPAND_ROUNDS): ByteArray =
+        Stamper.generateWorkblock(material, expandRounds)
 
-        for (n in 0 until expandRounds) {
-            // salt = SHA256(material + msgpack(n))
-            val msgpackN = packInt(n)
-            val saltInput = material + msgpackN
-            val salt = sha256(saltInput)
+    suspend fun generateStamp(workblock: ByteArray, stampCost: Int): StampResult =
+        StampResult(Stamper.generateStamp(workblock, stampCost))
 
-            // HKDF expand
-            val expanded = hkdfExpand(
-                ikm = material,
-                salt = salt,
-                info = ByteArray(0), // context=None
-                length = HKDF_OUTPUT_LENGTH
-            )
-            output.write(expanded)
-        }
-
-        return output.toByteArray()
-    }
-
-    /**
-     * Generate a valid stamp for the given workblock.
-     *
-     * Uses Kotlin coroutines for parallel stamp search across multiple CPU cores.
-     *
-     * @param workblock The pre-generated workblock
-     * @param stampCost The required stamp cost (number of leading zero bits)
-     * @return StampResult containing the stamp, its value, and total rounds tried
-     */
-    suspend fun generateStamp(
-        workblock: ByteArray,
-        stampCost: Int
-    ): StampResult = coroutineScope {
-        val startTime = System.currentTimeMillis()
-        val numWorkers = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
-
-        println("[$TAG] Starting stamp generation with cost $stampCost using $numWorkers workers")
-
-        // Use atomic reference for thread-safe result sharing
-        val found = AtomicReference<ByteArray?>(null)
-        val roundCounters = LongArray(numWorkers)
-
-        val jobs = (0 until numWorkers).map { workerId ->
-            async(Dispatchers.Default) {
-                val localRandom = SecureRandom()
-                var localRounds = 0L
-                val stamp = ByteArray(STAMP_SIZE)
-
-                while (found.get() == null && isActive) {
-                    localRandom.nextBytes(stamp)
-                    localRounds++
-
-                    if (isStampValid(stamp, stampCost, workblock)) {
-                        // Use compareAndSet to ensure only one worker sets the result
-                        found.compareAndSet(null, stamp.copyOf())
-                        break
-                    }
-
-                    // Periodically yield to allow cancellation and log progress
-                    if (localRounds % 1000 == 0L) {
-                        yield()
-                    }
-
-                    if (localRounds % PROGRESS_LOG_INTERVAL == 0L) {
-                        roundCounters[workerId] = localRounds
-                        val totalRounds = roundCounters.sum()
-                        val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-                        if (elapsed > 0) {
-                            val speed = (totalRounds / elapsed).toLong()
-                            println("[$TAG] Stamp generation running: $totalRounds rounds, $speed rounds/sec")
-                        }
-                    }
-                }
-
-                roundCounters[workerId] = localRounds
-                localRounds
-            }
-        }
-
-        // Wait for all workers to complete
-        jobs.awaitAll()
-
-        val totalRounds = roundCounters.sum()
-        val duration = (System.currentTimeMillis() - startTime) / 1000.0
-        val speed = if (duration > 0) (totalRounds / duration).toLong() else 0
-
-        val resultStamp = found.get()
-        val value = if (resultStamp != null) stampValue(workblock, resultStamp) else 0
-
-        println("[$TAG] Stamp generation complete: value=$value, rounds=$totalRounds, " +
-            "duration=${String.format(java.util.Locale.US, "%.2f", duration)}s, speed=$speed rounds/sec")
-
-        StampResult(resultStamp, value, totalRounds)
-    }
-
-    /**
-     * Convenience method that generates workblock and stamp in one call.
-     *
-     * @param messageId The message ID (hash) to generate stamp for
-     * @param stampCost The required stamp cost
-     * @param expandRounds Number of workblock expansion rounds
-     * @return StampResult with the generated stamp
-     */
     suspend fun generateStampWithWorkblock(
         messageId: ByteArray,
         stampCost: Int,
@@ -214,154 +76,39 @@ object LXStamper {
         return generateStamp(workblock, stampCost)
     }
 
-    /**
-     * Check if a stamp is valid for the given cost and workblock.
-     *
-     * Matches Python's stamp_valid():
-     * ```python
-     * target = 0b1 << 256-target_cost
-     * result = SHA256(workblock + stamp)
-     * return int(result) <= target
-     * ```
-     *
-     * @param stamp The stamp to validate
-     * @param targetCost The required stamp cost
-     * @param workblock The workblock to validate against
-     * @return True if the stamp meets the required cost
-     */
-    fun isStampValid(stamp: ByteArray, targetCost: Int, workblock: ByteArray): Boolean {
-        val target = BigInteger.ONE.shiftLeft(256 - targetCost)
-        val hash = sha256(workblock + stamp)
-        val result = BigInteger(1, hash) // Positive BigInteger from bytes
-        return result <= target
-    }
+    fun isStampValid(stamp: ByteArray, targetCost: Int, workblock: ByteArray): Boolean =
+        Stamper.stampValid(stamp, targetCost, workblock)
 
-    /**
-     * Calculate the value of a stamp (number of leading zero bits).
-     *
-     * Matches Python's stamp_value():
-     * ```python
-     * material = SHA256(workblock + stamp)
-     * i = int(material)
-     * value = 0
-     * while ((i & (1 << (bits - 1))) == 0):
-     *     i = (i << 1)
-     *     value += 1
-     * ```
-     *
-     * @param workblock The workblock
-     * @param stamp The stamp
-     * @return The stamp value (number of leading zero bits)
-     */
-    fun stampValue(workblock: ByteArray, stamp: ByteArray): Int {
-        val hash = sha256(workblock + stamp)
-        val bigInt = BigInteger(1, hash)
+    fun stampValue(workblock: ByteArray, stamp: ByteArray): Int =
+        Stamper.stampValue(workblock, stamp)
 
-        // Count leading zeros
-        // 256 - bitLength gives the number of leading zeros
-        return 256 - bigInt.bitLength()
-    }
-
-    /**
-     * Validate a stamp from a received message.
-     *
-     * @param stamp The stamp from the message
-     * @param messageHash The message hash (material for workblock)
-     * @param minCost Minimum required stamp cost
-     * @param expandRounds Workblock expansion rounds
-     * @return True if the stamp is valid
-     */
     fun validateStamp(
         stamp: ByteArray,
         messageHash: ByteArray,
         minCost: Int,
         expandRounds: Int = WORKBLOCK_EXPAND_ROUNDS
     ): Boolean {
-        if (stamp.size != STAMP_SIZE) {
-            return false
-        }
-
+        if (stamp.size != STAMP_SIZE) return false
         val workblock = generateWorkblock(messageHash, expandRounds)
         return isStampValid(stamp, minCost, workblock)
     }
 
-    /**
-     * Get the value of a stamp from a received message.
-     *
-     * @param stamp The stamp from the message
-     * @param messageHash The message hash
-     * @param expandRounds Workblock expansion rounds
-     * @return The stamp value, or 0 if invalid
-     */
     fun getStampValue(
         stamp: ByteArray,
         messageHash: ByteArray,
         expandRounds: Int = WORKBLOCK_EXPAND_ROUNDS
     ): Int {
-        if (stamp.size != STAMP_SIZE) {
-            return 0
-        }
-
+        if (stamp.size != STAMP_SIZE) return 0
         val workblock = generateWorkblock(messageHash, expandRounds)
         return stampValue(workblock, stamp)
     }
 
-    // ==================== Crypto Primitives ====================
+    // ==================== Crypto Primitives (delegated) ====================
 
-    /**
-     * SHA-256 hash.
-     */
-    fun sha256(data: ByteArray): ByteArray {
-        val digest = MessageDigest.getInstance("SHA-256")
-        return digest.digest(data)
-    }
+    fun sha256(data: ByteArray): ByteArray = Hashes.fullHash(data)
 
-    /**
-     * HKDF (HMAC-based Key Derivation Function) as per RFC 5869.
-     *
-     * This matches RNS.Cryptography.hkdf() which uses SHA-256.
-     */
-    fun hkdfExpand(
-        ikm: ByteArray,
-        salt: ByteArray,
-        info: ByteArray,
-        length: Int
-    ): ByteArray {
-        // Extract phase: PRK = HMAC-SHA256(salt, IKM)
-        val prk = hmacSha256(salt, ikm)
+    fun hkdfExpand(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray =
+        Stamper.hkdfExpand(ikm, salt, info, length)
 
-        // Expand phase
-        val hashLen = 32 // SHA-256 output length
-        val n = (length + hashLen - 1) / hashLen
-        val output = ByteArrayOutputStream(length)
-
-        var t = ByteArray(0)
-        for (i in 1..n) {
-            val input = t + info + byteArrayOf(i.toByte())
-            t = hmacSha256(prk, input)
-            output.write(t, 0, minOf(t.size, length - output.size()))
-        }
-
-        return output.toByteArray()
-    }
-
-    /**
-     * HMAC-SHA256.
-     */
-    private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
-        val mac = Mac.getInstance("HmacSHA256")
-        val secretKey = SecretKeySpec(key, "HmacSHA256")
-        mac.init(secretKey)
-        return mac.doFinal(data)
-    }
-
-    /**
-     * Pack an integer using MessagePack format.
-     * Matches Python's msgpack.packb(n).
-     */
-    fun packInt(n: Int): ByteArray {
-        val packer = MessagePack.newDefaultBufferPacker()
-        packer.packInt(n)
-        return packer.toByteArray()
-    }
+    fun packInt(n: Int): ByteArray = Stamper.packInt(n)
 }
