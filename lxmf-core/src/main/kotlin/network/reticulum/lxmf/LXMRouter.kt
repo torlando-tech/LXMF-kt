@@ -224,6 +224,7 @@ class LXMRouter(
     private val costFileMutex = Mutex()
     private val ticketFileMutex = Mutex()
     private val transientIdFileMutex = Mutex()
+    private val pendingOutboundFileMutex = Mutex()
 
     // ===== Initialization =====
 
@@ -240,6 +241,7 @@ class LXMRouter(
         loadOutboundStampCosts()
         loadAvailableTickets()
         loadTransientIds()
+        loadPendingOutbound()
 
         // Register announce handler for propagation nodes
         // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
@@ -465,6 +467,7 @@ class LXMRouter(
             pendingOutboundMutex.withLock {
                 pendingOutbound.add(message)
             }
+            savePendingOutboundAsync()
 
             // Trigger processing
             triggerProcessing()
@@ -540,7 +543,10 @@ class LXMRouter(
                 }
 
                 // Remove processed messages
-                pendingOutbound.removeAll(toRemove)
+                if (toRemove.isNotEmpty()) {
+                    pendingOutbound.removeAll(toRemove)
+                    savePendingOutboundAsync()
+                }
             }
         } finally {
             outboundProcessingMutex.unlock()
@@ -973,32 +979,42 @@ class LXMRouter(
 
     /**
      * Send a message via propagation node.
+     *
+     * Matches Python LXMessage.py lines 431-441 + LXMRouter process_outbound:
+     * 1. Generate propagation stamp if needed (PoW over transientId, not messageId)
+     * 2. Pack for propagation (encrypt body, compute transientId, wrap in envelope)
+     * 3. Send propagationPacked as Resource
      */
-    private fun sendViaPropagation(message: LXMessage, link: Link) {
-        val packed = message.packed ?: return
+    private suspend fun sendViaPropagation(message: LXMessage, link: Link) {
+        if (message.packed == null) return
 
         message.state = MessageState.SENDING
         message.method = DeliveryMethod.PROPAGATED
 
         try {
-            // Pack message data with timebase for propagation transfer
-            val buffer = java.io.ByteArrayOutputStream()
-            val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
+            // Generate propagation stamp if not already present
+            if (message.propagationStamp == null) {
+                val node = getActivePropagationNode()
+                val targetCost = if (node != null) {
+                    maxOf(
+                        LXMFConstants.PROPAGATION_COST_MIN,
+                        node.stampCost - node.stampCostFlexibility
+                    )
+                } else {
+                    LXMFConstants.PROPAGATION_COST
+                }
 
-            // Propagation transfer format: [timebase, [message_list]]
-            packer.packArrayHeader(2)
-            packer.packDouble(System.currentTimeMillis() / 1000.0)
+                message.getPropagationStamp(targetCost)
+            }
 
-            // Message list with just our message
-            packer.packArrayHeader(1)
-            packer.packBinaryHeader(packed.size)
-            packer.writePayload(packed)
-
-            packer.close()
+            // Pack for propagation (encrypt, compute transientId, build envelope)
+            message.packForPropagation()
+            val propagationData = message.propagationPacked
+                ?: throw IllegalStateException("packForPropagation() did not produce propagationPacked")
 
             // Send as Resource (propagation transfers are always Resource-based)
             val resource = Resource.create(
-                data = buffer.toByteArray(),
+                data = propagationData,
                 link = link,
                 callback = { _ ->
                     // Transfer complete - for propagated messages, SENT is final
@@ -1395,10 +1411,12 @@ class LXMRouter(
     }
 
     /**
-     * Stop the router processing loop.
+     * Stop the router processing loop and persist state.
      */
     fun stop() {
         running = false
+        // Persist pending outbound queue synchronously before cancelling scope
+        savePendingOutbound()
         processingJob?.cancel()
         processingScope?.cancel()
         processingScope = null
@@ -2369,6 +2387,170 @@ class LXMRouter(
         } catch (e: Exception) {
             println("[LXMRouter] Could not load transient IDs: ${e.message}")
             locallyDeliveredTransientIds.clear()
+        }
+    }
+
+    // ===== Pending Outbound Persistence =====
+
+    /**
+     * Save pending outbound messages to disk.
+     * File: {storagePath}/lxmf/pending_outbound (msgpack)
+     *
+     * Each entry stores the packed message bytes plus delivery state fields
+     * needed to reconstruct the message on reload.
+     */
+    private fun savePendingOutbound() {
+        val path = storagePath ?: return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+
+            val snapshot = synchronized(pendingOutbound) { pendingOutbound.toList() }
+
+            val buffer = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(buffer)
+
+            packer.packArrayHeader(snapshot.size)
+            for (message in snapshot) {
+                val packed = message.packed ?: continue
+                packer.packMapHeader(6)
+
+                // "packed" -> ByteArray
+                packer.packString("packed")
+                packer.packBinaryHeader(packed.size)
+                packer.writePayload(packed)
+
+                // "desired_method" -> Int
+                packer.packString("desired_method")
+                packer.packInt(message.desiredMethod?.value ?: DeliveryMethod.DIRECT.value)
+
+                // "attempts" -> Int
+                packer.packString("attempts")
+                packer.packInt(message.deliveryAttempts)
+
+                // "stamp_cost" -> Int or nil
+                packer.packString("stamp_cost")
+                if (message.stampCost != null) packer.packInt(message.stampCost!!)
+                else packer.packNil()
+
+                // "ticket" -> ByteArray or nil
+                packer.packString("ticket")
+                val ticket = message.outboundTicket
+                if (ticket != null) {
+                    packer.packBinaryHeader(ticket.size)
+                    packer.writePayload(ticket)
+                } else {
+                    packer.packNil()
+                }
+
+                // "include_ticket" -> Boolean
+                packer.packString("include_ticket")
+                packer.packBoolean(message.includeTicket)
+            }
+
+            packer.close()
+            File(dir, "pending_outbound").writeBytes(buffer.toByteArray())
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save pending outbound: ${e.message}")
+        }
+    }
+
+    private fun savePendingOutboundAsync() {
+        processingScope?.launch {
+            pendingOutboundFileMutex.withLock { savePendingOutbound() }
+        }
+    }
+
+    /**
+     * Load pending outbound messages from disk.
+     *
+     * Reconstructs LXMessage objects from persisted packed bytes and restores
+     * delivery state. Messages older than MESSAGE_EXPIRY (30 days) are skipped.
+     */
+    private fun loadPendingOutbound() {
+        val path = storagePath ?: return
+        val file = File(path, "lxmf/pending_outbound")
+        if (!file.exists()) return
+
+        try {
+            val data = file.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            val arraySize = unpacker.unpackArrayHeader()
+
+            val nowSeconds = System.currentTimeMillis() / 1000
+            var loaded = 0
+            var skipped = 0
+
+            for (i in 0 until arraySize) {
+                val mapSize = unpacker.unpackMapHeader()
+                var packed: ByteArray? = null
+                var desiredMethodValue: Int = DeliveryMethod.DIRECT.value
+                var attempts: Int = 0
+                var stampCost: Int? = null
+                var ticket: ByteArray? = null
+                var includeTicket: Boolean = false
+
+                for (j in 0 until mapSize) {
+                    val key = unpacker.unpackString()
+                    when (key) {
+                        "packed" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            packed = ByteArray(len)
+                            unpacker.readPayload(packed)
+                        }
+                        "desired_method" -> desiredMethodValue = unpacker.unpackInt()
+                        "attempts" -> attempts = unpacker.unpackInt()
+                        "stamp_cost" -> {
+                            stampCost = if (!unpacker.tryUnpackNil()) unpacker.unpackInt() else null
+                        }
+                        "ticket" -> {
+                            ticket = if (!unpacker.tryUnpackNil()) {
+                                val len = unpacker.unpackBinaryHeader()
+                                val bytes = ByteArray(len)
+                                unpacker.readPayload(bytes)
+                                bytes
+                            } else null
+                        }
+                        "include_ticket" -> includeTicket = unpacker.unpackBoolean()
+                        else -> unpacker.skipValue()
+                    }
+                }
+
+                if (packed == null) continue
+
+                // Reconstruct message from packed bytes
+                val desiredMethod = DeliveryMethod.fromValue(desiredMethodValue)
+                val message = LXMessage.unpackFromBytes(packed, desiredMethod) ?: continue
+
+                // Skip expired messages (older than MESSAGE_EXPIRY)
+                val messageAge = nowSeconds - (message.timestamp ?: 0.0)
+                if (messageAge > LXMFConstants.MESSAGE_EXPIRY) {
+                    skipped++
+                    continue
+                }
+
+                // Restore delivery state
+                message.state = MessageState.OUTBOUND
+                message.deliveryAttempts = attempts
+                message.stampCost = stampCost
+                message.outboundTicket = ticket
+                message.includeTicket = includeTicket
+                message.desiredMethod = desiredMethod
+
+                pendingOutbound.add(message)
+                loaded++
+            }
+
+            unpacker.close()
+
+            if (loaded > 0) {
+                println("[LXMRouter] Loaded $loaded pending outbound messages from disk")
+            }
+            if (skipped > 0) {
+                println("[LXMRouter] Skipped $skipped expired pending outbound messages")
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not load pending outbound: ${e.message}")
         }
     }
 

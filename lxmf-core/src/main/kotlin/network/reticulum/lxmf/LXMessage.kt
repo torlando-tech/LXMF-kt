@@ -137,6 +137,24 @@ class LXMessage private constructor(
     var paperPacked: ByteArray? = null
         private set
 
+    // ===== Propagation State =====
+
+    /** Encrypted message data for propagation (destination.encrypt(packed[DEST_LENGTH:])) */
+    private var pnEncryptedData: ByteArray? = null
+
+    /** Propagation stamp (PoW over transientId, not messageId) */
+    var propagationStamp: ByteArray? = null
+
+    /** Validated propagation stamp value (leading zero bits), or null if not checked */
+    var propagationStampValue: Int? = null
+
+    /** Whether the propagation stamp has been validated */
+    var propagationStampValid: Boolean = false
+
+    /** Packed bytes for PROPAGATED delivery: msgpack([timestamp, [destHash + encData + stamp]]) */
+    var propagationPacked: ByteArray? = null
+        private set
+
     // ===== Encryption State =====
 
     /** Whether message was transport-encrypted */
@@ -529,6 +547,99 @@ class LXMessage private constructor(
 
         method = DeliveryMethod.PAPER
         representation = MessageRepresentation.PACKET
+    }
+
+    /**
+     * Pack message for PROPAGATED delivery.
+     *
+     * Matches Python LXMessage.py lines 431-441 (PROPAGATED branch in pack()):
+     * 1. If not packed, call pack()
+     * 2. Encrypt packed[DEST_LENGTH:] via destination.encrypt() -> pnEncryptedData
+     * 3. Build lxmfData = destHash + pnEncryptedData
+     * 4. Compute transientId = SHA256(lxmfData)
+     * 5. If propagationStamp set, append it: lxmfData += propagationStamp
+     * 6. propagationPacked = msgpack([timestamp, [lxmfData]])
+     *
+     * @throws IllegalStateException if destination is null
+     */
+    fun packForPropagation() {
+        if (packed == null) {
+            pack()
+        }
+
+        val dest = destination
+            ?: throw IllegalStateException("Cannot pack for propagation without destination")
+
+        val packedData = packed!!
+
+        // Encrypt everything after the destination hash for the recipient
+        if (pnEncryptedData == null) {
+            val plainData = packedData.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedData.size)
+            pnEncryptedData = dest.encrypt(plainData)
+        }
+
+        // Build LXMF data: destHash + encryptedData
+        var lxmfData = packedData.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH) + pnEncryptedData!!
+
+        // Compute transientId over destHash + encryptedData (BEFORE stamp)
+        transientId = Hashes.fullHash(lxmfData)
+
+        // Append propagation stamp if available
+        if (propagationStamp != null) {
+            lxmfData += propagationStamp!!
+        }
+
+        // Wrap in propagation transfer format: msgpack([timestamp, [lxmfData]])
+        val buffer = ByteArrayOutputStream()
+        val packer = MessagePack.newDefaultPacker(buffer)
+        packer.packArrayHeader(2)
+        packer.packDouble(System.currentTimeMillis() / 1000.0)
+        packer.packArrayHeader(1)
+        packer.packBinaryHeader(lxmfData.size)
+        packer.writePayload(lxmfData)
+        packer.close()
+
+        propagationPacked = buffer.toByteArray()
+    }
+
+    /**
+     * Get or generate the propagation stamp for this message.
+     *
+     * Matches Python LXMessage.get_propagation_stamp() (lines 334-358):
+     * 1. Return cached propagationStamp if already generated
+     * 2. If transientId is null, call packForPropagation() first
+     * 3. Generate stamp via LXStamper with WORKBLOCK_EXPAND_ROUNDS_PN
+     * 4. Cache result
+     *
+     * @param targetCost Required stamp cost (leading zero bits)
+     * @return Stamp bytes, or null if generation failed
+     */
+    suspend fun getPropagationStamp(targetCost: Int): ByteArray? {
+        // Return cached stamp
+        if (propagationStamp != null) return propagationStamp
+
+        // Ensure transientId is available
+        if (transientId == null) {
+            packForPropagation()
+        }
+
+        val tid = transientId ?: return null
+
+        // Generate stamp over transientId with PN expansion rounds
+        val result = LXStamper.generateStampWithWorkblock(
+            tid,
+            targetCost,
+            expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN
+        )
+
+        if (result.stamp != null) {
+            propagationStamp = result.stamp
+            propagationStampValue = result.value
+            propagationStampValid = true
+            return result.stamp
+        }
+
+        return null
     }
 
     override fun toString(): String {
