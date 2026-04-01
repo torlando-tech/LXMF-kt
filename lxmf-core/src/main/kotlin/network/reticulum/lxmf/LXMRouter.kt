@@ -1694,7 +1694,15 @@ class LXMRouter(
      */
     fun getActivePropagationNode(): PropagationNode? {
         val hash = activePropagationNodeHash ?: return null
-        return propagationNodes[hash]
+        propagationNodes[hash]?.let { return it }
+
+        // Node not in map — try late recall (identities may have loaded after setActive was called)
+        val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val identity = Identity.recall(destHash) ?: return null
+        val node = PropagationNode(destHash = destHash, identity = identity, isActive = true)
+        propagationNodes[hash] = node
+        println("Late-recalled propagation node identity for $hash")
+        return node
     }
 
     /**
