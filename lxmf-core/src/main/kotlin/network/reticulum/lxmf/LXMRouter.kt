@@ -1424,6 +1424,9 @@ class LXMRouter(
     fun start() {
         if (running) return
 
+        // Load persisted propagation nodes from disk
+        loadPropagationNodes()
+
         running = true
         processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -1633,6 +1636,7 @@ class LXMRouter(
                 )
 
             propagationNodes[node.hexHash] = node
+            savePropagationNodes()
             println("Discovered propagation node: ${node.hexHash} (${displayName ?: "unnamed"})")
         } catch (e: Exception) {
             println("Error parsing propagation announce: ${e.message}")
@@ -1698,15 +1702,7 @@ class LXMRouter(
 
         // Node not in map — try late recall (identities may have loaded after setActive was called)
         val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-        val identity = Identity.recall(destHash)
-        if (identity == null) {
-            println(
-                "getActivePropagationNode: hash=$hash, propagationNodes.size=${propagationNodes.size}, Identity.recall=null, knownDests keys sample=${propagationNodes.keys.take(
-                    3,
-                )}",
-            )
-            return null
-        }
+        val identity = Identity.recall(destHash) ?: return null
         val node = PropagationNode(destHash = destHash, identity = identity, isActive = true)
         propagationNodes[hash] = node
         println("Late-recalled propagation node identity for $hash")
@@ -1852,6 +1848,7 @@ class LXMRouter(
             outboundPropagationLink = link
         } catch (e: Exception) {
             println("Failed to establish propagation link: ${e.message}")
+            e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
@@ -2748,6 +2745,123 @@ class LXMRouter(
             i += 2
         }
         return data
+    }
+
+    // ===== Propagation Node Persistence =====
+
+    private fun getPropagationNodesFile(): java.io.File? {
+        val path = storagePath ?: return null
+        val dir = java.io.File(path, "lxmf")
+        if (!dir.exists()) dir.mkdirs()
+        return java.io.File(dir, "propagation_nodes")
+    }
+
+    private fun savePropagationNodes() {
+        val file = getPropagationNodesFile() ?: return
+        try {
+            val buffer = java.io.ByteArrayOutputStream()
+            val packer =
+                org.msgpack.core.MessagePack
+                    .newDefaultPacker(buffer)
+            val nodes = propagationNodes.values.toList()
+            packer.packMapHeader(nodes.size)
+            for (node in nodes) {
+                packer.packString(node.hexHash)
+                packer.packMapHeader(8)
+                packer.packString("dest_hash")
+                packer.packBinaryHeader(node.destHash.size)
+                packer.writePayload(node.destHash)
+                packer.packString("identity_pub")
+                packer.packBinaryHeader(node.identity.getPublicKey().size)
+                packer.writePayload(node.identity.getPublicKey())
+                packer.packString("display_name")
+                if (node.displayName != null) packer.packString(node.displayName!!) else packer.packNil()
+                packer.packString("timebase")
+                packer.packLong(node.timebase)
+                packer.packString("is_active")
+                packer.packBoolean(node.isActive)
+                packer.packString("per_transfer_limit")
+                packer.packInt(node.perTransferLimit)
+                packer.packString("per_sync_limit")
+                packer.packInt(node.perSyncLimit)
+                packer.packString("stamp_cost")
+                packer.packInt(node.stampCost)
+            }
+            packer.close()
+            file.writeBytes(buffer.toByteArray())
+            println("Saved ${nodes.size} propagation nodes to ${file.name}")
+        } catch (e: Exception) {
+            println("Error saving propagation nodes: ${e.message}")
+        }
+    }
+
+    private fun loadPropagationNodes() {
+        val file = getPropagationNodesFile() ?: return
+        if (!file.exists()) return
+        try {
+            val data = file.readBytes()
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(data)
+            val mapSize = unpacker.unpackMapHeader()
+            var loaded = 0
+            for (i in 0 until mapSize) {
+                val hexHash = unpacker.unpackString()
+                val fieldCount = unpacker.unpackMapHeader()
+                var destHash: ByteArray? = null
+                var pubKey: ByteArray? = null
+                var displayName: String? = null
+                var timebase = 0L
+                var isActive = true
+                var perTransferLimit = LXMFConstants.PROPAGATION_LIMIT_KB
+                var perSyncLimit = LXMFConstants.SYNC_LIMIT_KB
+                var stampCost = LXMFConstants.PROPAGATION_COST
+
+                for (j in 0 until fieldCount) {
+                    val key = unpacker.unpackString()
+                    when (key) {
+                        "dest_hash" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            destHash = ByteArray(len)
+                            unpacker.readPayload(destHash)
+                        }
+                        "identity_pub" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            pubKey = ByteArray(len)
+                            unpacker.readPayload(pubKey)
+                        }
+                        "display_name" -> displayName = if (!unpacker.tryUnpackNil()) unpacker.unpackString() else null
+                        "timebase" -> timebase = unpackAsLong(unpacker)
+                        "is_active" -> isActive = unpacker.unpackBoolean()
+                        "per_transfer_limit" -> perTransferLimit = unpackAsInt(unpacker)
+                        "per_sync_limit" -> perSyncLimit = unpackAsInt(unpacker)
+                        "stamp_cost" -> stampCost = unpackAsInt(unpacker)
+                        else -> unpacker.skipValue()
+                    }
+                }
+
+                if (destHash != null && pubKey != null) {
+                    val identity = Identity.fromPublicKey(pubKey)
+                    val node =
+                        PropagationNode(
+                            destHash = destHash,
+                            identity = identity,
+                            displayName = displayName,
+                            timebase = timebase,
+                            isActive = isActive,
+                            perTransferLimit = perTransferLimit,
+                            perSyncLimit = perSyncLimit,
+                            stampCost = stampCost,
+                        )
+                    propagationNodes[hexHash] = node
+                    loaded++
+                }
+            }
+            unpacker.close()
+            println("Loaded $loaded propagation nodes from ${file.name}")
+        } catch (e: Exception) {
+            println("Error loading propagation nodes: ${e.message}")
+        }
     }
 
     /** Unpack a msgpack value as Int, tolerating float encoding. Matches Python's int() coercion. */
