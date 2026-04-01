@@ -1646,10 +1646,29 @@ class LXMRouter(
      * @return True if the node was set successfully
      */
     fun setActivePropagationNode(destHashHex: String): Boolean {
-        val node = propagationNodes[destHashHex]
-        if (node == null || !node.isActive) {
-            println("Cannot set inactive or unknown propagation node: $destHashHex")
-            return false
+        var node = propagationNodes[destHashHex]
+
+        // If node isn't in the in-memory map (announce hasn't arrived yet),
+        // try to recall the identity from Transport and create a minimal entry.
+        // The full details will be populated when the announce arrives.
+        if (node == null) {
+            val destHash = destHashHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            val recalledIdentity = Identity.recall(destHash)
+            if (recalledIdentity != null) {
+                node =
+                    PropagationNode(
+                        destHash = destHash,
+                        identity = recalledIdentity,
+                        isActive = true,
+                    )
+                propagationNodes[destHashHex] = node
+                println("Created minimal propagation node entry from recalled identity: $destHashHex")
+            } else {
+                println("Cannot set propagation node: no announce and no recalled identity for $destHashHex")
+                // Still save the hash — the announce may arrive later
+                activePropagationNodeHash = destHashHex
+                return true
+            }
         }
 
         activePropagationNodeHash = destHashHex
