@@ -1562,23 +1562,23 @@ class LXMRouter(
             unpacker.skipValue()
 
             // [1] Timebase (int - unix timestamp)
-            val timebase = if (!unpacker.tryUnpackNil()) unpacker.unpackLong() else 0L
+            val timebase = if (!unpacker.tryUnpackNil()) unpackAsLong(unpacker) else 0L
 
             // [2] Node state (bool - active propagation node)
             val isActive = if (!unpacker.tryUnpackNil()) unpacker.unpackBoolean() else true
 
-            // [3] Per-transfer limit (int KB)
+            // [3] Per-transfer limit (int KB) — some nodes send as float
             val perTransferLimit =
                 if (!unpacker.tryUnpackNil()) {
-                    unpacker.unpackInt()
+                    unpackAsInt(unpacker)
                 } else {
                     LXMFConstants.PROPAGATION_LIMIT_KB
                 }
 
-            // [4] Per-sync limit (int KB)
+            // [4] Per-sync limit (int KB) — some nodes send as float
             val perSyncLimit =
                 if (!unpacker.tryUnpackNil()) {
-                    unpacker.unpackInt()
+                    unpackAsInt(unpacker)
                 } else {
                     LXMFConstants.SYNC_LIMIT_KB
                 }
@@ -1590,9 +1590,9 @@ class LXMRouter(
 
             if (!unpacker.tryUnpackNil()) {
                 val costArraySize = unpacker.unpackArrayHeader()
-                if (costArraySize >= 1) stampCost = unpacker.unpackInt()
-                if (costArraySize >= 2) stampCostFlex = unpacker.unpackInt()
-                if (costArraySize >= 3) peeringCost = unpacker.unpackInt()
+                if (costArraySize >= 1) stampCost = unpackAsInt(unpacker)
+                if (costArraySize >= 2) stampCostFlex = unpackAsInt(unpacker)
+                if (costArraySize >= 3) peeringCost = unpackAsInt(unpacker)
             }
 
             // [6] Metadata (map with node name, etc.)
@@ -1962,7 +1962,7 @@ class LXMRouter(
                 responseCallback = { receipt ->
                     val responseData = receipt.response
                     if (responseData != null) {
-                        handleMessageGetResponse(responseData, wantedIds.size)
+                        handleMessageGetResponse(link, responseData, wantedIds.size)
                     } else {
                         propagationTransferState = PropagationTransferState.FAILED
                         println("Message get request returned null response")
@@ -1983,6 +1983,7 @@ class LXMRouter(
      * Handle the message get response from a propagation node.
      */
     private fun handleMessageGetResponse(
+        link: Link,
         response: ByteArray,
         expectedCount: Int,
     ) {
@@ -2005,11 +2006,18 @@ class LXMRouter(
             // Python's message_get_request returns [lxmf_data, lxmf_data, ...]
             val messageCount = unpacker.unpackArrayHeader()
             var receivedCount = 0
+            val receivedHashes = mutableListOf<ByteArray>()
 
             for (i in 0 until messageCount) {
                 val dataLen = unpacker.unpackBinaryHeader()
                 val messageData = ByteArray(dataLen)
                 unpacker.readPayload(messageData)
+
+                // Track transient ID for deletion acknowledgment (Python line 1561)
+                receivedHashes.add(
+                    network.reticulum.crypto.Hashes
+                        .fullHash(messageData),
+                )
 
                 // Process the message
                 processInboundDelivery(messageData, DeliveryMethod.PROPAGATED)
@@ -2019,6 +2027,22 @@ class LXMRouter(
             }
 
             unpacker.close()
+
+            // Send third request to acknowledge/delete received messages on the node
+            // Matches Python LXMRouter.py:1566-1572
+            if (receivedHashes.isNotEmpty()) {
+                try {
+                    link.request(
+                        path = LXMFConstants.MESSAGE_GET_PATH,
+                        data = listOf(null, receivedHashes),
+                        failedCallback = { _ ->
+                            println("Failed to send deletion acknowledgment to propagation node")
+                        },
+                    )
+                } catch (e: Exception) {
+                    println("Error sending deletion acknowledgment: ${e.message}")
+                }
+            }
 
             propagationTransferState = PropagationTransferState.COMPLETE
             propagationTransferProgress = 1.0
@@ -2717,4 +2741,26 @@ class LXMRouter(
         }
         return data
     }
+
+    /** Unpack a msgpack value as Int, tolerating float encoding. Matches Python's int() coercion. */
+    private fun unpackAsInt(unpacker: org.msgpack.core.MessageUnpacker): Int =
+        when (unpacker.nextFormat.valueType) {
+            org.msgpack.value.ValueType.INTEGER -> unpacker.unpackInt()
+            org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble().toInt()
+            else -> {
+                unpacker.skipValue()
+                0
+            }
+        }
+
+    /** Unpack a msgpack value as Long, tolerating float encoding. */
+    private fun unpackAsLong(unpacker: org.msgpack.core.MessageUnpacker): Long =
+        when (unpacker.nextFormat.valueType) {
+            org.msgpack.value.ValueType.INTEGER -> unpacker.unpackLong()
+            org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble().toLong()
+            else -> {
+                unpacker.skipValue()
+                0L
+            }
+        }
 }
