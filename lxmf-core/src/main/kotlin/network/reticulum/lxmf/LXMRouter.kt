@@ -18,6 +18,7 @@ import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
@@ -241,16 +242,17 @@ class LXMRouter(
         loadAvailableTickets()
         loadTransientIds()
 
-        // Register announce handler for propagation nodes
-        // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
-        // so we handle all announces and let handlePropagationAnnounce filter by appData format.
-        Transport.registerAnnounceHandler { destHash, identity, appData ->
-            // Only call handler if this looks like a propagation announce (has appData)
-            if (appData != null && appData.isNotEmpty()) {
-                handlePropagationAnnounce(destHash, identity, appData)
-            }
-            false // Don't consume - let other handlers see it too
-        }
+        // Register announce handler for propagation nodes with aspect filter.
+        // Transport only calls this for announces matching "lxmf.propagation".
+        Transport.registerAnnounceHandler(
+            handler = AnnounceHandler { destHash, identity, appData ->
+                if (appData != null && appData.isNotEmpty()) {
+                    handlePropagationAnnounce(destHash, identity, appData)
+                }
+                false // Don't consume - let other handlers see it too
+            },
+            aspectFilter = "lxmf.propagation",
+        )
     }
 
     /**
