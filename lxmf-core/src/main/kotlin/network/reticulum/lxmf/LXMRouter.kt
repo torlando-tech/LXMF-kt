@@ -1750,8 +1750,14 @@ class LXMRouter(
     fun requestMessagesFromPropagationNode() {
         val node = getActivePropagationNode()
         if (node == null) {
+            // Identity not available yet — request path so it arrives for next cycle
+            val hash = activePropagationNodeHash
+            if (hash != null) {
+                val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                Transport.requestPath(destHash)
+                println("Propagation node identity not available, requested path for $hash")
+            }
             propagationTransferState = PropagationTransferState.FAILED
-            println("No active propagation node to request from")
             return
         }
 
