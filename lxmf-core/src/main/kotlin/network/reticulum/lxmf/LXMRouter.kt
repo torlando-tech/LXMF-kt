@@ -1771,6 +1771,7 @@ class LXMRouter(
 
         // Check if we have an active link
         val link = outboundPropagationLink
+        System.err.println("[LXMRouter] requestMessages: link=${link != null}, status=${link?.status}, node=${node.hexHash.take(12)}")
         if (link != null && link.status == LinkConstants.ACTIVE) {
             propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
             requestMessageList(link)
@@ -1778,6 +1779,7 @@ class LXMRouter(
             // Need to establish link first
             establishPropagationLink(node)
         }
+        System.err.println("[LXMRouter] requestMessages: returning, state=$propagationTransferState")
     }
 
     /**
@@ -1805,11 +1807,13 @@ class LXMRouter(
                     appName = APP_NAME,
                     PROPAGATION_ASPECT,
                 )
+            println("establishPropagationLink: dest=${destination.hexHash}, hasPath=${Transport.hasPath(node.destHash)}")
 
             val link =
                 Link.create(
                     destination = destination,
                     establishedCallback = { establishedLink ->
+                        println("establishPropagationLink: LINK ESTABLISHED!")
                         outboundPropagationLink = establishedLink
                         propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
 
