@@ -881,12 +881,17 @@ class LXMRouter(
      */
     private fun identifyOnLink(link: Link) {
         // Get our first delivery destination's identity
-        val deliveryDest = deliveryDestinations.values.firstOrNull() ?: return
+        val deliveryDest = deliveryDestinations.values.firstOrNull()
+        if (deliveryDest == null) {
+            System.err.println("[LXMRouter] identifyOnLink: NO delivery destinations registered!")
+            return
+        }
 
         try {
+            System.err.println("[LXMRouter] identifyOnLink: identifying as ${deliveryDest.identity.hexHash.take(12)}")
             link.identify(deliveryDest.identity)
         } catch (e: Exception) {
-            println("Failed to identify on link: ${e.message}")
+            System.err.println("[LXMRouter] identifyOnLink FAILED: ${e.message}")
         }
     }
 
@@ -1822,6 +1827,7 @@ class LXMRouter(
 
                         if (forRetrieval) {
                             // Retrieval path: request message list (Python line 510)
+                            System.err.println("[LXMRouter] Calling requestMessageList on established link")
                             requestMessageList(establishedLink)
                         } else {
                             // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
@@ -1862,31 +1868,40 @@ class LXMRouter(
      */
     private fun requestMessageList(link: Link) {
         propagationTransferState = PropagationTransferState.LISTING_MESSAGES
+        System.err.println("[LXMRouter] requestMessageList: link.status=${link.status}, path=${LXMFConstants.MESSAGE_GET_PATH}")
 
         try {
             // Send LIST request: [None, None]
             // Python sends [None, None] as data, which gets packed by Link.request
             val requestData = listOf(null, null)
 
-            link.request(
-                path = LXMFConstants.MESSAGE_GET_PATH,
-                data = requestData,
-                responseCallback = { receipt ->
-                    val responseData = receipt.response
-                    if (responseData != null) {
-                        handleMessageListResponse(link, responseData)
-                    } else {
+            val receipt =
+                link.request(
+                    path = LXMFConstants.MESSAGE_GET_PATH,
+                    data = requestData,
+                    responseCallback = { receipt ->
+                        val responseData = receipt.response
+                        System.err.println(
+                            "[LXMRouter] messageList response: size=${responseData?.size}, hex=${responseData?.take(
+                                20,
+                            )?.joinToString("") { "%02x".format(it) }}",
+                        )
+                        if (responseData != null) {
+                            handleMessageListResponse(link, responseData)
+                        } else {
+                            propagationTransferState = PropagationTransferState.FAILED
+                            System.err.println("[LXMRouter] Message list request returned null response")
+                        }
+                    },
+                    failedCallback = { _ ->
                         propagationTransferState = PropagationTransferState.FAILED
-                        println("Message list request returned null response")
-                    }
-                },
-                failedCallback = { _ ->
-                    propagationTransferState = PropagationTransferState.FAILED
-                    println("Message list request failed")
-                },
-            )
+                        println("Message list request failed")
+                    },
+                )
+            System.err.println("[LXMRouter] requestMessageList: receipt=$receipt")
         } catch (e: Exception) {
-            println("Failed to request message list: ${e.message}")
+            System.err.println("[LXMRouter] requestMessageList EXCEPTION: ${e.message}")
+            e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
