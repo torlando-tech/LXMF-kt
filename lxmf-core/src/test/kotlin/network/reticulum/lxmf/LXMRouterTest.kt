@@ -380,10 +380,12 @@ class LXMRouterTest {
     }
 
     @Test
-    fun `test set active propagation node without known node fails`() {
-        // Try to set unknown node
+    fun `test set active propagation node without known node saves hash for later`() {
+        // Setting an unknown node now succeeds (saves hash for later announce arrival)
         val result = router.setActivePropagationNode("0123456789abcdef")
-        assertEquals(false, result)
+        assertEquals(true, result)
+        // Node object won't exist (no recalled identity), but hash is saved internally
+        // getActivePropagationNode returns null because Identity.recall fails
         assertEquals(null, router.getActivePropagationNode())
     }
 

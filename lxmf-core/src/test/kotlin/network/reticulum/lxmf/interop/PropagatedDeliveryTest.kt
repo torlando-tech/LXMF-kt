@@ -132,27 +132,24 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
 
         println("[KT] Final message state: ${message.state}")
 
-        // TCP transport layer verified working (Plans 01-02)
-        // LXMF propagation link now triggers processOutbound on establishment (Plan 04)
-        // Message should progress past OUTBOUND to SENDING (transfer started), SENT, or DELIVERED
-        // Note: Full delivery to SENT requires Python propagation node to acknowledge the Resource
-        // which may have separate protocol issues. The key validation is that we're no longer stuck at OUTBOUND.
+        // Message should reach at least SENDING (transfer started)
+        // KNOWN ISSUE: Message reaches SENT (Kotlin thinks transfer succeeded) but
+        // Python propagation node shows 0 stored messages — likely a format mismatch
+        // in the propagated message data that causes Python to silently reject it.
         val progressStates = listOf(MessageState.SENDING, MessageState.SENT, MessageState.DELIVERED)
-        if (message.state !in progressStates) {
-            println("[KT] ERROR: Expected SENDING/SENT/DELIVERED but got ${message.state}")
-            println("[KT] Message hash: ${message.hash?.toHex()}")
-        }
         progressStates shouldContain message.state
 
-        // Log delivery state for tracking
-        when (message.state) {
-            MessageState.SENDING -> println("[KT] Note: Message is being transferred, awaiting node acknowledgment")
-            MessageState.SENT -> println("[KT] Message accepted by propagation node")
-            MessageState.DELIVERED -> println("[KT] Message fully delivered and confirmed")
-            else -> {}
+        println("[KT] Message state: ${message.state}")
+
+        // Check propagation node storage (currently 0 — investigating format issue)
+        val storedMessages = getPropagationNodeMessages()
+        println("[KT] Messages in propagation node: ${storedMessages.size}")
+        if (storedMessages.isEmpty()) {
+            println("[KT] KNOWN ISSUE: Python prop node has 0 messages despite SENT state")
+            println("[KT] This indicates the LXMF propagation data format may not match Python expectations")
         }
 
-        println("\n=== Test passed (link establishment callback fix verified) ===")
+        println("\n=== Propagation upload test passed (link + transfer working, storage pending) ===")
         Unit
     }
 
@@ -171,9 +168,8 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
         )
 
         if (!submitResult.submitted) {
-            println("[Test] Note: Could not submit test message: ${submitResult.error}")
-            println("[Test] This may be due to identity recall issues - marking as passed with note")
-            // This is expected in some test environments where Python cannot recall Kotlin's identity
+            println("[Test] Could not submit test message: ${submitResult.error}")
+            println("[Test] This requires Python to recall Kotlin's identity (from announce)")
             return@runBlocking Unit
         }
 
@@ -181,15 +177,47 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
 
         // Verify message appears in propagation node
         val messageAppeared = waitForMessageInPropagationNode(timeoutMs = 10000)
-        if (!messageAppeared) {
-            println("[Test] Note: Message did not appear in propagation node storage")
-            println("[Test] This may be expected if message was delivered locally")
-            return@runBlocking Unit
-        }
+        messageAppeared shouldBe true
+        println("[Test] Message appeared in propagation node")
 
         val storedMessages = getPropagationNodeMessages()
         println("[Test] Messages in propagation node: ${storedMessages.size}")
         storedMessages.size shouldBeGreaterThanOrEqual 1
+
+        // Debug: compare stored destination hash with our destination hash
+        for (msg in storedMessages) {
+            println("[Test] Stored msg dest_hash: ${msg.destinationHash.toHex()}, our dest_hash: ${kotlinDestination.hexHash}")
+            println("[Test] Match: ${msg.destinationHash.toHex() == kotlinDestination.hexHash}")
+        }
+
+        // Debug: check if Python has our ratchet and identity
+        try {
+            val ratchetCheck = python("check_known_ratchet", "destination_hash" to kotlinDestination.hexHash)
+            println("[Test] Python has ratchet for our dest: ${ratchetCheck}")
+
+            // Test: encrypt with our public key directly (bypassing Identity.recall)
+            val encResult = python(
+                "propagation_encrypt_for_recipient",
+                "recipient_public_key" to kotlinDestination.identity!!.getPublicKey(),
+                "plaintext" to "test".toByteArray()
+            )
+            println("[Test] Python encrypt debug:")
+            println("[Test]   identity_hash=${encResult.getString("identity_hash")}")
+            println("[Test]   salt=${encResult.getString("salt")}")
+            println("[Test]   shared_key=${encResult.getString("shared_key").take(16)}...")
+            println("[Test]   derived_key=${encResult.getString("derived_key").take(32)}...")
+            println("[Test]   used_ratchet=${encResult.getString("used_ratchet")}")
+            println("[Test]   ratchet_pub_used=${encResult.getString("ratchet_pub_used").take(16)}...")
+            println("[Test] Kotlin identity hash: ${kotlinDestination.identity!!.hexHash}")
+            println("[Test] Kotlin salt should be: ${kotlinDestination.identity!!.hash.joinToString("") { "%02x".format(it) }}")
+
+            // Try decrypting the test data from this direct encryption
+            val testEnc = encResult.getBytes("encrypted_data")
+            val testDec = kotlinDestination.decrypt(testEnc)
+            println("[Test] Direct encrypt/decrypt test: ${if (testDec != null) "SUCCESS" else "FAILED"}")
+        } catch (e: Exception) {
+            println("[Test] Could not check ratchet: ${e.message}")
+        }
 
         // Request messages from propagation node
         println("[Test] Requesting messages from propagation node...")
@@ -217,15 +245,30 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
         println("[Test] Transfer result: complete=$transferComplete, state=${kotlinRouter.propagationTransferState}")
         println("[Test] Messages retrieved: ${kotlinRouter.propagationTransferLastResult}")
 
-        // TCP transport layer is verified working at HDLC/framing level (Plans 01 and 02)
-        // Higher-level protocol (LXMF propagation/retrieval) may still have issues
-        if (transferComplete != true) {
-            println("[Test] Note: Transfer did not complete, state=${kotlinRouter.propagationTransferState}")
-            println("[Test] This may indicate LXMF propagation protocol issues beyond TCP layer")
+        println("[Test] Transfer complete=$transferComplete, state=${kotlinRouter.propagationTransferState}")
+        println("[Test] Messages retrieved: ${kotlinRouter.propagationTransferLastResult}")
+
+        transferComplete shouldBe true
+        kotlinRouter.propagationTransferLastResult shouldBeGreaterThanOrEqual 1
+
+        // Verify Kotlin received the message via delivery callback
+        val messageReceived = withTimeoutOrNull(5.seconds) {
+            while (receivedMessages.isEmpty()) {
+                delay(100)
+            }
+            true
         }
 
-        // Log transfer result - partial success is acceptable while LXMF protocol is being debugged
-        println("\n=== Test passed (retrieval mechanism exercised) ===")
+        messageReceived shouldBe true
+        receivedMessages.size shouldBeGreaterThanOrEqual 1
+
+        // Verify message content integrity through full propagation round-trip
+        val retrieved = receivedMessages.first()
+        retrieved.content shouldBe "Message stored for Kotlin retrieval"
+        retrieved.title shouldBe "Retrieval Test"
+
+        println("[Test] Retrieved message: title='${retrieved.title}', content='${retrieved.content}'")
+        println("\n=== Propagation sync download: FULL SUCCESS ===")
         Unit
     }
 

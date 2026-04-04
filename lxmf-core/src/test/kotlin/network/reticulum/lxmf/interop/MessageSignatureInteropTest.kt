@@ -412,8 +412,9 @@ class MessageSignatureInteropTest : LXMFInteropTestBase() {
             println("  [Kotlin] Packed message with fresh source, size=${unrememberedPacked.size} bytes")
             println("  [Kotlin] Fresh source hash: ${freshSourceDest.hash.toHex()}")
 
-            // Clear the fresh identity from cache if it was accidentally added
-            // (The Identity.create() doesn't add to cache, but let's be explicit)
+            // Deregister the source destination from Transport so Identity.recall()
+            // cannot find it via the Transport fallback lookup
+            network.reticulum.transport.Transport.deregisterDestination(freshSourceDest)
 
             // Attempt to unpack - should have SOURCE_UNKNOWN because we didn't remember the source
             val unpacked = LXMessage.unpackFromBytes(unrememberedPacked)
