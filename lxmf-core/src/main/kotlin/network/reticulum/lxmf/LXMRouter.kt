@@ -148,6 +148,11 @@ class LXMRouter(
     var propagationTransferLastResult: Int = 0
         private set
 
+    // ===== Configuration =====
+
+    /** Maximum incoming message size in KB. Null = unlimited. */
+    var incomingMessageSizeLimitKb: Int? = null
+
     // ===== Callbacks =====
 
     /** Callback for delivered messages */
@@ -1275,6 +1280,14 @@ class LXMRouter(
         link: Link? = null,
     ) {
         println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
+
+        // Enforce incoming message size limit
+        val limitKb = incomingMessageSizeLimitKb
+        if (limitKb != null && data.size > limitKb * 1024) {
+            println("[LXMRouter] Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit")
+            return
+        }
+
         try {
             // For PROPAGATED messages from a propagation node, the data is encrypted:
             //   data = dest_hash(16) + encrypted(source_hash + signature + payload)
