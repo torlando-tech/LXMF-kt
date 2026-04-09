@@ -34,27 +34,20 @@ import java.util.Base64
 class LXMessage private constructor(
     /** Destination for this message */
     val destination: Destination?,
-
     /** Source destination (sender) */
     val source: Destination?,
-
     /** Destination hash (always available even if destination is null) */
     val destinationHash: ByteArray,
-
     /** Source hash (always available even if source is null) */
     val sourceHash: ByteArray,
-
     /** Message title */
     var title: String,
-
     /** Message content */
     var content: String,
-
     /** Extended fields dictionary */
     val fields: MutableMap<Int, Any> = mutableMapOf(),
-
     /** Desired delivery method */
-    var desiredMethod: DeliveryMethod? = null
+    var desiredMethod: DeliveryMethod? = null,
 ) {
     // ===== Message Identification =====
 
@@ -188,8 +181,9 @@ class LXMessage private constructor(
         }
 
         // Get source identity for signing
-        val sourceIdentity = source?.identity
-            ?: throw IllegalStateException("Cannot pack message without source identity")
+        val sourceIdentity =
+            source?.identity
+                ?: throw IllegalStateException("Cannot pack message without source identity")
         require(sourceIdentity.hasPrivateKey) { "Cannot pack message: source has no private key" }
 
         // Build payload: [timestamp, title, content, fields]
@@ -252,11 +246,12 @@ class LXMessage private constructor(
                     println("Opportunistic delivery requested but content too large ($contentSize bytes), falling back to DIRECT")
                     desiredMethod = DeliveryMethod.DIRECT
                     method = DeliveryMethod.DIRECT
-                    representation = if (contentSize <= LXMFConstants.LINK_PACKET_MAX_CONTENT) {
-                        MessageRepresentation.PACKET
-                    } else {
-                        MessageRepresentation.RESOURCE
-                    }
+                    representation =
+                        if (contentSize <= LXMFConstants.LINK_PACKET_MAX_CONTENT) {
+                            MessageRepresentation.PACKET
+                        } else {
+                            MessageRepresentation.RESOURCE
+                        }
                 } else {
                     method = DeliveryMethod.OPPORTUNISTIC
                     representation = MessageRepresentation.PACKET
@@ -264,11 +259,12 @@ class LXMessage private constructor(
             }
             DeliveryMethod.DIRECT -> {
                 method = DeliveryMethod.DIRECT
-                representation = if (contentSize <= LXMFConstants.LINK_PACKET_MAX_CONTENT) {
-                    MessageRepresentation.PACKET
-                } else {
-                    MessageRepresentation.RESOURCE
-                }
+                representation =
+                    if (contentSize <= LXMFConstants.LINK_PACKET_MAX_CONTENT) {
+                        MessageRepresentation.PACKET
+                    } else {
+                        MessageRepresentation.RESOURCE
+                    }
             }
             DeliveryMethod.PROPAGATED -> {
                 method = DeliveryMethod.PROPAGATED
@@ -294,7 +290,7 @@ class LXMessage private constructor(
         title: String,
         content: String,
         fields: Map<Int, Any>,
-        stamp: ByteArray?
+        stamp: ByteArray?,
     ): ByteArray {
         val buffer = ByteArrayOutputStream()
         val packer = MessagePack.newDefaultPacker(buffer)
@@ -336,17 +332,16 @@ class LXMessage private constructor(
     /**
      * Pack a value into msgpack format (recursive for nested structures).
      */
-    private fun packValue(packer: org.msgpack.core.MessagePacker, value: Any) {
+    private fun packValue(
+        packer: org.msgpack.core.MessagePacker,
+        value: Any,
+    ) {
         when (value) {
             is ByteArray -> {
                 packer.packBinaryHeader(value.size)
                 packer.writePayload(value)
             }
-            is String -> {
-                val bytes = value.toByteArray(Charsets.UTF_8)
-                packer.packBinaryHeader(bytes.size)
-                packer.writePayload(bytes)
-            }
+            is String -> packer.packString(value)
             is Int -> packer.packInt(value)
             is Long -> packer.packLong(value)
             is Double -> packer.packDouble(value)
@@ -355,17 +350,26 @@ class LXMessage private constructor(
             is List<*> -> {
                 packer.packArrayHeader(value.size)
                 for (item in value) {
-                    if (item != null) packValue(packer, item)
-                    else packer.packNil()
+                    if (item != null) {
+                        packValue(packer, item)
+                    } else {
+                        packer.packNil()
+                    }
                 }
             }
             is Map<*, *> -> {
                 packer.packMapHeader(value.size)
                 for ((k, v) in value) {
-                    if (k != null) packValue(packer, k)
-                    else packer.packNil()
-                    if (v != null) packValue(packer, v)
-                    else packer.packNil()
+                    if (k != null) {
+                        packValue(packer, k)
+                    } else {
+                        packer.packNil()
+                    }
+                    if (v != null) {
+                        packValue(packer, v)
+                    } else {
+                        packer.packNil()
+                    }
                 }
             }
             else -> {
@@ -412,7 +416,10 @@ class LXMessage private constructor(
      * @param tickets List of valid inbound tickets, or null
      * @return True if stamp is valid
      */
-    fun validateStamp(targetCost: Int, tickets: List<ByteArray>? = null): Boolean {
+    fun validateStamp(
+        targetCost: Int,
+        tickets: List<ByteArray>? = null,
+    ): Boolean {
         val msgHash = hash ?: return false
         val msgStamp = stamp
 
@@ -499,8 +506,9 @@ class LXMessage private constructor(
             pack()
         }
 
-        val pp = paperPacked
-            ?: throw IllegalStateException("Paper packing not done — call packForPaper() first or use PAPER delivery method")
+        val pp =
+            paperPacked
+                ?: throw IllegalStateException("Paper packing not done — call packForPaper() first or use PAPER delivery method")
 
         val encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(pp)
         return "${URI_SCHEMA}://$encoded"
@@ -519,8 +527,9 @@ class LXMessage private constructor(
             pack()
         }
 
-        val dest = destination
-            ?: throw IllegalStateException("Cannot pack for paper without destination")
+        val dest =
+            destination
+                ?: throw IllegalStateException("Cannot pack for paper without destination")
 
         val packedData = packed!!
         val plainData = packedData.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedData.size)
@@ -539,6 +548,7 @@ class LXMessage private constructor(
     companion object {
         /** URI schema prefix */
         const val URI_SCHEMA = "lxm"
+
         /**
          * Create a new outbound LXMF message.
          *
@@ -556,9 +566,9 @@ class LXMessage private constructor(
             content: String,
             title: String = "",
             fields: MutableMap<Int, Any> = mutableMapOf(),
-            desiredMethod: DeliveryMethod? = DeliveryMethod.DIRECT
-        ): LXMessage {
-            return LXMessage(
+            desiredMethod: DeliveryMethod? = DeliveryMethod.DIRECT,
+        ): LXMessage =
+            LXMessage(
                 destination = destination,
                 source = source,
                 destinationHash = destination.hash,
@@ -566,9 +576,8 @@ class LXMessage private constructor(
                 title = title,
                 content = content,
                 fields = fields,
-                desiredMethod = desiredMethod
+                desiredMethod = desiredMethod,
             )
-        }
 
         /**
          * Unpack an LXMF message from wire format bytes.
@@ -585,7 +594,10 @@ class LXMessage private constructor(
          * @param originalMethod The original delivery method (optional)
          * @return Unpacked LXMessage, or null if unpacking fails
          */
-        fun unpackFromBytes(lxmfBytes: ByteArray, originalMethod: DeliveryMethod? = null): LXMessage? {
+        fun unpackFromBytes(
+            lxmfBytes: ByteArray,
+            originalMethod: DeliveryMethod? = null,
+        ): LXMessage? {
             try {
                 // Minimum size: dest_hash (16) + source_hash (16) + signature (64) + some payload
                 val minHeaderSize = 2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH
@@ -596,18 +608,21 @@ class LXMessage private constructor(
 
                 // Extract fixed-length fields
                 val destinationHash = lxmfBytes.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
-                val sourceHash = lxmfBytes.copyOfRange(
-                    LXMFConstants.DESTINATION_LENGTH,
-                    2 * LXMFConstants.DESTINATION_LENGTH
-                )
-                val signature = lxmfBytes.copyOfRange(
-                    2 * LXMFConstants.DESTINATION_LENGTH,
-                    2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH
-                )
-                val packedPayload = lxmfBytes.copyOfRange(
-                    2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH,
-                    lxmfBytes.size
-                )
+                val sourceHash =
+                    lxmfBytes.copyOfRange(
+                        LXMFConstants.DESTINATION_LENGTH,
+                        2 * LXMFConstants.DESTINATION_LENGTH,
+                    )
+                val signature =
+                    lxmfBytes.copyOfRange(
+                        2 * LXMFConstants.DESTINATION_LENGTH,
+                        2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH,
+                    )
+                val packedPayload =
+                    lxmfBytes.copyOfRange(
+                        2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH,
+                        lxmfBytes.size,
+                    )
 
                 // Unpack msgpack payload
                 val unpacker = MessagePack.newDefaultUnpacker(packedPayload)
@@ -635,14 +650,15 @@ class LXMessage private constructor(
                 val fields = unpackFields(unpacker)
 
                 // [4] stamp (optional)
-                val stamp: ByteArray? = if (arraySize > 4) {
-                    val stampLen = unpacker.unpackBinaryHeader()
-                    val stampBytes = ByteArray(stampLen)
-                    unpacker.readPayload(stampBytes)
-                    stampBytes
-                } else {
-                    null
-                }
+                val stamp: ByteArray? =
+                    if (arraySize > 4) {
+                        val stampLen = unpacker.unpackBinaryHeader()
+                        val stampBytes = ByteArray(stampLen)
+                        unpacker.readPayload(stampBytes)
+                        stampBytes
+                    } else {
+                        null
+                    }
 
                 unpacker.close()
 
@@ -663,27 +679,34 @@ class LXMessage private constructor(
                 val sourceIdentity = Identity.recall(sourceHash)
 
                 // Create destinations if identities are known
-                val destination = if (destinationIdentity != null) {
-                    // Note: We'd need to create a destination here, but for incoming
-                    // messages we typically don't need the full destination object
-                    null
-                } else null
+                val destination =
+                    if (destinationIdentity != null) {
+                        // Note: We'd need to create a destination here, but for incoming
+                        // messages we typically don't need the full destination object
+                        null
+                    } else {
+                        null
+                    }
 
-                val source = if (sourceIdentity != null) {
-                    null
-                } else null
+                val source =
+                    if (sourceIdentity != null) {
+                        null
+                    } else {
+                        null
+                    }
 
                 // Create message
-                val message = LXMessage(
-                    destination = destination,
-                    source = source,
-                    destinationHash = destinationHash,
-                    sourceHash = sourceHash,
-                    title = titleBytes.toString(Charsets.UTF_8),
-                    content = contentBytes.toString(Charsets.UTF_8),
-                    fields = fields,
-                    desiredMethod = originalMethod
-                )
+                val message =
+                    LXMessage(
+                        destination = destination,
+                        source = source,
+                        destinationHash = destinationHash,
+                        sourceHash = sourceHash,
+                        title = titleBytes.toString(Charsets.UTF_8),
+                        content = contentBytes.toString(Charsets.UTF_8),
+                        fields = fields,
+                        desiredMethod = originalMethod,
+                    )
 
                 message.hash = messageHash
                 message.signature = signature
@@ -712,7 +735,6 @@ class LXMessage private constructor(
                 }
 
                 return message
-
             } catch (e: Exception) {
                 println("Error unpacking LXMF message: ${e.message}")
                 e.printStackTrace()
@@ -795,7 +817,7 @@ class LXMessage private constructor(
             timestamp: Double,
             titleBytes: ByteArray,
             contentBytes: ByteArray,
-            fields: Map<Int, Any>
+            fields: Map<Int, Any>,
         ): ByteArray {
             val buffer = ByteArrayOutputStream()
             val packer = MessagePack.newDefaultPacker(buffer)
@@ -828,7 +850,10 @@ class LXMessage private constructor(
         /**
          * Repack a value for hash verification.
          */
-        private fun repackValue(packer: org.msgpack.core.MessagePacker, value: Any) {
+        private fun repackValue(
+            packer: org.msgpack.core.MessagePacker,
+            value: Any,
+        ) {
             when (value) {
                 is ByteArray -> {
                     packer.packBinaryHeader(value.size)
@@ -843,17 +868,26 @@ class LXMessage private constructor(
                 is List<*> -> {
                     packer.packArrayHeader(value.size)
                     for (item in value) {
-                        if (item != null) repackValue(packer, item)
-                        else packer.packNil()
+                        if (item != null) {
+                            repackValue(packer, item)
+                        } else {
+                            packer.packNil()
+                        }
                     }
                 }
                 is Map<*, *> -> {
                     packer.packMapHeader(value.size)
                     for ((k, v) in value) {
-                        if (k != null) repackValue(packer, k)
-                        else packer.packNil()
-                        if (v != null) repackValue(packer, v)
-                        else packer.packNil()
+                        if (k != null) {
+                            repackValue(packer, k)
+                        } else {
+                            packer.packNil()
+                        }
+                        if (v != null) {
+                            repackValue(packer, v)
+                        } else {
+                            packer.packNil()
+                        }
                     }
                 }
                 else -> packer.packString(value.toString())

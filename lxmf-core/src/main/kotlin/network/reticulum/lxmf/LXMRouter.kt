@@ -18,6 +18,7 @@ import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
@@ -37,12 +38,10 @@ import java.util.concurrent.ConcurrentHashMap
 class LXMRouter(
     /** Identity for this router (optional, for creating destinations) */
     private val identity: Identity? = null,
-
     /** Storage path for router data */
     private val storagePath: String? = null,
-
     /** Whether to automatically peer with propagation nodes */
-    private val autopeer: Boolean = true
+    private val autopeer: Boolean = true,
 ) {
     // ===== Configuration Constants =====
 
@@ -58,6 +57,13 @@ class LXMRouter(
 
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
+
+        /**
+         * Retry pending direct links after this long.
+         * This prevents a link request sent before path discovery completes
+         * from remaining stuck in PENDING for the full link watchdog timeout.
+         */
+        const val PENDING_LINK_RETRY_TIMEOUT = 15000L
 
         /** Maximum pathless delivery attempts before requesting path */
         const val MAX_PATHLESS_TRIES = 1
@@ -115,8 +121,8 @@ class LXMRouter(
     /** Backchannel links for replies: destination_hash -> Link */
     private val backchannelLinks = ConcurrentHashMap<String, Link>()
 
-    /** Destinations with pending link establishments */
-    private val pendingLinkEstablishments = ConcurrentHashMap.newKeySet<String>()
+    /** Destinations with pending link establishments: destination_hash -> started_at_ms */
+    private val pendingLinkEstablishments = ConcurrentHashMap<String, Long>()
 
     /** Pending resource transfers: message_hash -> (message, resource) */
     private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
@@ -148,6 +154,11 @@ class LXMRouter(
     @Volatile
     var propagationTransferLastResult: Int = 0
         private set
+
+    // ===== Configuration =====
+
+    /** Maximum incoming message size in KB. Null = unlimited. */
+    var incomingMessageSizeLimitKb: Int? = null
 
     // ===== Callbacks =====
 
@@ -241,16 +252,18 @@ class LXMRouter(
         loadAvailableTickets()
         loadTransientIds()
 
-        // Register announce handler for propagation nodes
-        // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
-        // so we handle all announces and let handlePropagationAnnounce filter by appData format.
-        Transport.registerAnnounceHandler { destHash, identity, appData ->
-            // Only call handler if this looks like a propagation announce (has appData)
-            if (appData != null && appData.isNotEmpty()) {
-                handlePropagationAnnounce(destHash, identity, appData)
-            }
-            false // Don't consume - let other handlers see it too
-        }
+        // Register announce handler for propagation nodes with aspect filter.
+        // Transport only calls this for announces matching "lxmf.propagation".
+        Transport.registerAnnounceHandler(
+            handler =
+                AnnounceHandler { destHash, identity, appData ->
+                    if (appData != null && appData.isNotEmpty()) {
+                        handlePropagationAnnounce(destHash, identity, appData)
+                    }
+                    false // Don't consume - let other handlers see it too
+                },
+            aspectFilter = "lxmf.propagation",
+        )
     }
 
     /**
@@ -260,7 +273,7 @@ class LXMRouter(
         val destination: Destination,
         val identity: Identity,
         val displayName: String? = null,
-        var stampCost: Int? = null
+        var stampCost: Int? = null,
     )
 
     /**
@@ -288,7 +301,7 @@ class LXMRouter(
         /** Peering cost */
         val peeringCost: Int = LXMFConstants.PEERING_COST,
         /** When this node was last seen (announcement timestamp) */
-        val lastSeen: Long = System.currentTimeMillis()
+        val lastSeen: Long = System.currentTimeMillis(),
     ) {
         val hexHash: String get() = destHash.toHexString()
 
@@ -315,7 +328,7 @@ class LXMRouter(
         COMPLETE,
         FAILED,
         NO_PATH,
-        NO_LINK
+        NO_LINK,
     }
 
     // ===== Registration Methods =====
@@ -334,18 +347,21 @@ class LXMRouter(
     fun registerDeliveryIdentity(
         identity: Identity,
         displayName: String? = null,
-        stampCost: Int? = null
+        stampCost: Int? = null,
     ): Destination {
         // Create destination with LXMF delivery aspect
-        val destination = Destination.create(
-            identity = identity,
-            direction = DestinationDirection.IN,
-            type = DestinationType.SINGLE,
-            appName = APP_NAME,
-            DELIVERY_ASPECT
-        )
+        val destination =
+            Destination.create(
+                identity = identity,
+                direction = DestinationDirection.IN,
+                type = DestinationType.SINGLE,
+                appName = APP_NAME,
+                DELIVERY_ASPECT,
+            )
 
         // Enable ratchets for forward secrecy
+        // Fixed: The issue was that destinations were incorrectly storing ratchet public keys
+        // under their own hash, confusing the encryption/decryption logic.
         storagePath?.let { path ->
             val ratchetPath = "$path/lxmf/ratchets/${destination.hexHash}"
             destination.enableRatchets(ratchetPath)
@@ -371,12 +387,13 @@ class LXMRouter(
         Transport.registerDestination(destination)
 
         // Store the delivery destination
-        val deliveryDest = DeliveryDestination(
-            destination = destination,
-            identity = identity,
-            displayName = displayName,
-            stampCost = stampCost
-        )
+        val deliveryDest =
+            DeliveryDestination(
+                destination = destination,
+                identity = identity,
+                displayName = displayName,
+                stampCost = stampCost,
+            )
         deliveryDestinations[destination.hexHash] = deliveryDest
 
         return destination
@@ -680,13 +697,14 @@ class LXMRouter(
         println("[LXMRouter]   Plain data (first 32 bytes): ${plainData.take(32).toByteArray().toHexString()}")
 
         // Create the packet - Packet.create() will encrypt the data for us
-        val packet = Packet.create(
-            destination = dest,
-            data = plainData,
-            packetType = PacketType.DATA,
-            context = PacketContext.NONE,
-            transportType = TransportType.BROADCAST
-        )
+        val packet =
+            Packet.create(
+                destination = dest,
+                data = plainData,
+                packetType = PacketType.DATA,
+                context = PacketContext.NONE,
+                transportType = TransportType.BROADCAST,
+            )
 
         println("[LXMRouter]   Packed packet size: ${packet.raw?.size ?: packet.pack().size} bytes")
 
@@ -732,21 +750,53 @@ class LXMRouter(
         println("[LXMRouter] processDirectDelivery: directLinks keys=${directLinks.keys}")
         println("[LXMRouter] processDirectDelivery: backchannelLinks keys=${backchannelLinks.keys}")
 
-        // Check for existing active link that WE initiated (directLinks only)
-        // Note: We don't use backchannelLinks because the remote peer may not have set up
-        // resource receive callbacks on links THEY initiated. We need to establish our own link.
+        // Check for existing active link — prefer directLinks (WE initiated),
+        // fall back to backchannelLinks (THEY initiated). Python LXMF sets up
+        // resource receive callbacks on ALL links via delivery_link_established,
+        // so backchannel links are safe to send on.
         var link = directLinks[destHashHex]
-        println("[LXMRouter] processDirectDelivery: found link=${link != null}, status=${link?.status}")
+        if (link == null || link.status != LinkConstants.ACTIVE) {
+            // Try backchannel if direct link isn't active
+            val backchannel = backchannelLinks[destHashHex]
+            if (backchannel != null && backchannel.status == LinkConstants.ACTIVE) {
+                link = backchannel
+            }
+        }
+        println(
+            "[LXMRouter] processDirectDelivery: found link=${link != null}, status=${link?.status}, source=${if (link != null &&
+                backchannelLinks.containsValue(
+                    link,
+                )
+            ) {
+                "backchannel"
+            } else {
+                "direct"
+            }}",
+        )
 
         when {
             link != null && link.status == LinkConstants.ACTIVE -> {
-                // Use existing active link
+                // Use existing active link (direct or backchannel)
                 sendViaLink(message, link)
             }
 
             link != null && link.status == LinkConstants.PENDING -> {
-                // Link is being established, wait
-                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                val pendingSince = pendingLinkEstablishments[destHashHex]
+                val pendingAge = pendingSince?.let { System.currentTimeMillis() - it } ?: 0L
+                val hasPathNow = Transport.hasPath(message.destinationHash)
+
+                if (hasPathNow && pendingAge >= PENDING_LINK_RETRY_TIMEOUT) {
+                    println(
+                        "[LXMRouter] processDirectDelivery: pending link for $destHashHex has been stuck for ${pendingAge}ms; tearing down and re-establishing now that a path exists",
+                    )
+                    directLinks.remove(destHashHex)
+                    pendingLinkEstablishments.remove(destHashHex)
+                    link.teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
+                    establishLinkForMessage(message)
+                } else {
+                    // Link is being established, wait
+                    message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                }
             }
 
             link != null && link.status == LinkConstants.CLOSED -> {
@@ -777,44 +827,44 @@ class LXMRouter(
         val destHashHex = message.destinationHash.toHexString()
 
         // Check if we're already establishing a link
-        if (pendingLinkEstablishments.contains(destHashHex)) {
+        if (pendingLinkEstablishments.containsKey(destHashHex)) {
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             return
         }
 
-        pendingLinkEstablishments.add(destHashHex)
+        pendingLinkEstablishments[destHashHex] = System.currentTimeMillis()
 
         try {
             // Create the link
-            val link = Link.create(
-                destination = destination,
-                establishedCallback = { establishedLink ->
-                    // Link established successfully
-                    directLinks[destHashHex] = establishedLink
-                    pendingLinkEstablishments.remove(destHashHex)
+            val link =
+                Link.create(
+                    destination = destination,
+                    establishedCallback = { establishedLink ->
+                        // Link established successfully
+                        directLinks[destHashHex] = establishedLink
+                        pendingLinkEstablishments.remove(destHashHex)
 
-                    // Set up link callbacks for receiving
-                    setupLinkCallbacks(establishedLink, destHashHex)
+                        // Set up link callbacks for receiving
+                        setupLinkCallbacks(establishedLink, destHashHex)
 
-                    // Identify ourselves on the link
-                    identifyOnLink(establishedLink)
+                        // Identify ourselves on the link
+                        identifyOnLink(establishedLink)
 
-                    // Trigger processing to send pending messages
-                    triggerProcessing()
-                },
-                closedCallback = { closedLink ->
-                    // Link closed
-                    directLinks.remove(destHashHex)
-                    pendingLinkEstablishments.remove(destHashHex)
+                        // Trigger processing to send pending messages
+                        triggerProcessing()
+                    },
+                    closedCallback = { closedLink ->
+                        // Link closed
+                        directLinks.remove(destHashHex)
+                        pendingLinkEstablishments.remove(destHashHex)
 
-                    // Notify messages that need this link
-                    handleLinkClosed(destHashHex)
-                }
-            )
+                        // Notify messages that need this link
+                        handleLinkClosed(destHashHex)
+                    },
+                )
 
             // Store pending link
             directLinks[destHashHex] = link
-
         } catch (e: Exception) {
             pendingLinkEstablishments.remove(destHashHex)
             println("Failed to establish link to $destHashHex: ${e.message}")
@@ -825,7 +875,10 @@ class LXMRouter(
     /**
      * Set up callbacks on an established link.
      */
-    private fun setupLinkCallbacks(link: Link, destHashHex: String) {
+    private fun setupLinkCallbacks(
+        link: Link,
+        destHashHex: String,
+    ) {
         // Packet callback for receiving messages
         link.setPacketCallback { data, packet ->
             // Send proof back to sender for delivery confirmation
@@ -856,12 +909,17 @@ class LXMRouter(
      */
     private fun identifyOnLink(link: Link) {
         // Get our first delivery destination's identity
-        val deliveryDest = deliveryDestinations.values.firstOrNull() ?: return
+        val deliveryDest = deliveryDestinations.values.firstOrNull()
+        if (deliveryDest == null) {
+            println("[LXMRouter] identifyOnLink: NO delivery destinations registered!")
+            return
+        }
 
         try {
+            println("[LXMRouter] identifyOnLink: identifying as ${deliveryDest.identity.hexHash.take(12)}")
             link.identify(deliveryDest.identity)
         } catch (e: Exception) {
-            println("Failed to identify on link: ${e.message}")
+            println("[LXMRouter] identifyOnLink FAILED: ${e.message}")
         }
     }
 
@@ -873,7 +931,8 @@ class LXMRouter(
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
                     if (message.destinationHash.toHexString() == destHashHex &&
-                        message.state == MessageState.SENDING) {
+                        message.state == MessageState.SENDING
+                    ) {
                         // Reset to outbound for retry
                         message.state = MessageState.OUTBOUND
                         message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
@@ -886,7 +945,10 @@ class LXMRouter(
     /**
      * Handle a resource transfer being concluded.
      */
-    private fun handleResourceConcluded(resource: Any, link: Link) {
+    private fun handleResourceConcluded(
+        resource: Any,
+        link: Link,
+    ) {
         // Cast to Resource and extract data
         val res = resource as? Resource
         if (res == null) {
@@ -974,46 +1036,90 @@ class LXMRouter(
     /**
      * Send a message via propagation node.
      */
-    private fun sendViaPropagation(message: LXMessage, link: Link) {
+    private fun sendViaPropagation(
+        message: LXMessage,
+        link: Link,
+    ) {
         val packed = message.packed ?: return
 
         message.state = MessageState.SENDING
         message.method = DeliveryMethod.PROPAGATED
 
         try {
-            // Pack message data with timebase for propagation transfer
-            val buffer = java.io.ByteArrayOutputStream()
-            val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
+            // Build propagation format matching Python LXMessage.pack() lines 434-441:
+            //   1. Encrypt: pn_encrypted = destination.encrypt(packed[DEST_LEN:])
+            //   2. Build:   lxm_data = destHash + pn_encrypted
+            //   3. Compute: transient_id = full_hash(lxm_data)
+            //   4. Stamp:   propagation_stamp = generate_stamp(transient_id, cost)
+            //   5. Wire:    transient_data = lxm_data + propagation_stamp
+            //
+            // Python's validate_pn_stamp() splits: lxm_data = data[:-STAMP_SIZE], stamp = data[-STAMP_SIZE:]
+            // Then: transient_id = full_hash(lxm_data), workblock = stamp_workblock(transient_id)
+            val destHash = packed.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
+            val plainData = packed.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed.size)
 
-            // Propagation transfer format: [timebase, [message_list]]
+            val dest = message.destination
+                ?: throw IllegalStateException("Cannot propagate without destination")
+            val encryptedData = dest.encrypt(plainData)
+
+            // lxm_data = destHash + encrypted (this is what transient_id is computed from)
+            val lxmData = destHash + encryptedData
+
+            // Compute transient_id and generate propagation stamp against it
+            // (NOT against message.hash — the stamp must validate against transient_id)
+            val transientId = network.reticulum.crypto.Hashes.fullHash(lxmData)
+            val propStampResult = kotlinx.coroutines.runBlocking {
+                LXStamper.generateStampWithWorkblock(
+                    messageId = transientId,
+                    stampCost = getActivePropagationNode()?.stampCost ?: 8,
+                    expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN,
+                )
+            }
+            val propStamp = propStampResult.stamp
+            println("[LXMRouter] Propagation stamp generated: value=${propStampResult.value}, cost=${getActivePropagationNode()?.stampCost}")
+
+            // Append propagation stamp (Python strips last STAMP_SIZE bytes before computing transient_id)
+            val transientData = if (propStamp != null) lxmData + propStamp else lxmData
+
+            // Pack for wire: msgpack([timebase, [transient_data, ...]])
+            val buffer = java.io.ByteArrayOutputStream()
+            val packer =
+                org.msgpack.core.MessagePack
+                    .newDefaultPacker(buffer)
+
             packer.packArrayHeader(2)
             packer.packDouble(System.currentTimeMillis() / 1000.0)
 
             // Message list with just our message
             packer.packArrayHeader(1)
-            packer.packBinaryHeader(packed.size)
-            packer.writePayload(packed)
+            packer.packBinaryHeader(transientData.size)
+            packer.writePayload(transientData)
 
             packer.close()
 
             // Send as Resource (propagation transfers are always Resource-based)
-            val resource = Resource.create(
-                data = buffer.toByteArray(),
-                link = link,
-                callback = { _ ->
-                    // Transfer complete - for propagated messages, SENT is final
-                    message.state = MessageState.SENT
-                    message.deliveryCallback?.invoke(message)
-                },
-                progressCallback = { progressResource ->
-                    message.progress = progressResource.progress.toDouble()
-                }
-            )
+            val resource =
+                Resource.create(
+                    data = buffer.toByteArray(),
+                    link = link,
+                    callback = { _ ->
+                        // Transfer complete - for propagated messages, SENT is final
+                        message.state = MessageState.SENT
+                        message.deliveryCallback?.invoke(message)
+                    },
+                    progressCallback = { progressResource ->
+                        message.progress = progressResource.progress.toDouble()
+                    },
+                )
 
             // Track the resource
             val messageHashHex = message.hash?.toHexString() ?: ""
+            resource.callbacks.failed = {
+                pendingResources.remove(messageHashHex)
+                message.state = MessageState.FAILED
+                message.failedCallback?.invoke(message)
+            }
             pendingResources[messageHashHex] = Pair(message, resource)
-
         } catch (e: Exception) {
             println("Failed to send via propagation: ${e.message}")
             message.state = MessageState.OUTBOUND
@@ -1024,7 +1130,10 @@ class LXMRouter(
     /**
      * Send a message via an established link.
      */
-    private fun sendViaLink(message: LXMessage, link: Link) {
+    private fun sendViaLink(
+        message: LXMessage,
+        link: Link,
+    ) {
         val packed = message.packed ?: return
 
         message.state = MessageState.SENDING
@@ -1035,7 +1144,7 @@ class LXMRouter(
             //   elif self.method == LXMessage.DIRECT:
             //       return RNS.Packet(self.__delivery_destination, self.packed)
             // And unpack_from_bytes expects the destination hash at the start.
-            val lxmfData = packed  // Full packed message including destination hash
+            val lxmfData = packed // Full packed message including destination hash
             // Send as packet over link with receipt tracking
             try {
                 val receipt = link.sendWithReceipt(lxmfData)
@@ -1068,21 +1177,27 @@ class LXMRouter(
             // Python's __as_resource() sends self.packed (full message including dest hash)
             try {
                 val messageHashHex = message.hash?.toHexString() ?: ""
-                val resource = Resource.create(
-                    data = packed,  // Full packed message, matches Python's __as_resource()
-                    link = link,
-                    callback = { completedResource ->
-                        // Resource transfer complete
-                        pendingResources.remove(messageHashHex)
-                        message.state = MessageState.DELIVERED
-                        message.progress = 1.0
-                        message.deliveryCallback?.invoke(message)
-                    },
-                    progressCallback = { progressResource ->
-                        // Update progress (Resource provides progress as 0.0-1.0 Float)
-                        message.progress = progressResource.progress.toDouble()
-                    }
-                )
+                val resource =
+                    Resource.create(
+                        data = packed, // Full packed message, matches Python's __as_resource()
+                        link = link,
+                        callback = { completedResource ->
+                            // Resource transfer complete
+                            pendingResources.remove(messageHashHex)
+                            message.state = MessageState.DELIVERED
+                            message.progress = 1.0
+                            message.deliveryCallback?.invoke(message)
+                        },
+                        progressCallback = { progressResource ->
+                            // Update progress (Resource provides progress as 0.0-1.0 Float)
+                            message.progress = progressResource.progress.toDouble()
+                        },
+                    )
+                resource.callbacks.failed = {
+                    pendingResources.remove(messageHashHex)
+                    message.state = MessageState.FAILED
+                    message.failedCallback?.invoke(message)
+                }
 
                 // Track resource for completion
                 pendingResources[messageHashHex] = Pair(message, resource)
@@ -1100,7 +1215,11 @@ class LXMRouter(
     /**
      * Handle an incoming delivery packet.
      */
-    private fun handleDeliveryPacket(data: ByteArray, destination: Destination, packet: Packet?) {
+    private fun handleDeliveryPacket(
+        data: ByteArray,
+        destination: Destination,
+        packet: Packet?,
+    ) {
         // CRITICAL: Send proof back to sender FIRST, before processing
         // This is what triggers delivery confirmation on the sender side
         packet?.prove()
@@ -1120,7 +1239,10 @@ class LXMRouter(
     /**
      * Handle a new delivery link being established.
      */
-    private fun handleDeliveryLinkEstablished(link: Link, destination: Destination) {
+    private fun handleDeliveryLinkEstablished(
+        link: Link,
+        destination: Destination,
+    ) {
         // Set up link callbacks for packets
         link.setPacketCallback { data, packet ->
             // Send proof back to sender for delivery confirmation
@@ -1159,10 +1281,10 @@ class LXMRouter(
             // This is needed because receivers use Identity.recall(message.sourceHash)
             // to get the sender's identity for replies
             Identity.remember(
-                packetHash = link.hash,  // Use link hash as packet hash
-                destHash = lxmfDestHash,  // Use LXMF destination hash as lookup key
+                packetHash = link.hash, // Use link hash as packet hash
+                destHash = lxmfDestHash, // Use LXMF destination hash as lookup key
                 publicKey = remoteIdentity.getPublicKey(),
-                appData = null
+                appData = null,
             )
             println("[LXMRouter] Stored identity for LXMF dest: $lxmfDestHashHex")
         }
@@ -1186,12 +1308,48 @@ class LXMRouter(
         data: ByteArray,
         method: DeliveryMethod,
         destination: Destination? = null,
-        link: Link? = null
+        link: Link? = null,
     ) {
         println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
+
+        // Enforce incoming message size limit
+        val limitKb = incomingMessageSizeLimitKb
+        if (limitKb != null && data.size > limitKb * 1024) {
+            println("[LXMRouter] Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit")
+            return
+        }
+
         try {
+            // For PROPAGATED messages from a propagation node, the data is encrypted:
+            //   data = dest_hash(16) + encrypted(source_hash + signature + payload)
+            // We need to decrypt using our delivery destination before unpacking.
+            // Matches Python LXMRouter.lxmf_propagation() lines 2322-2328.
+            val lxmfData = if (method == DeliveryMethod.PROPAGATED) {
+                val destHash = data.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
+                val destHashHex = destHash.toHexString()
+                val deliveryDest = deliveryDestinations[destHashHex]
+                if (deliveryDest != null) {
+                    val encryptedData = data.copyOfRange(LXMFConstants.DESTINATION_LENGTH, data.size)
+                    println("[LXMRouter] Decrypting propagated message: encrypted=${encryptedData.size} bytes, identity.hasPrivateKey=${deliveryDest.destination.identity?.hasPrivateKey}")
+                    val decryptedData = deliveryDest.destination.decrypt(encryptedData)
+                    if (decryptedData != null) {
+                        println("[LXMRouter] Decrypted propagated message for $destHashHex")
+                        destHash + decryptedData
+                    } else {
+                        println("[LXMRouter] Failed to decrypt propagated message for $destHashHex")
+                        return
+                    }
+                } else {
+                    // Not addressed to us — shouldn't happen in normal flow
+                    println("[LXMRouter] Propagated message not for us: $destHashHex")
+                    return
+                }
+            } else {
+                data
+            }
+
             // Unpack the message
-            val message = LXMessage.unpackFromBytes(data, method)
+            val message = LXMessage.unpackFromBytes(lxmfData, method)
             if (message == null) {
                 println("[LXMRouter] Failed to unpack LXMF message")
                 return
@@ -1269,7 +1427,7 @@ class LXMRouter(
                             packetHash = link.hash,
                             destHash = lxmfDestHash,
                             publicKey = remoteIdentity.getPublicKey(),
-                            appData = null
+                            appData = null,
                         )
                         println("[LXMRouter] Stored identity from link for LXMF dest: $sourceHashHex")
                     }
@@ -1285,7 +1443,6 @@ class LXMRouter(
 
             // Invoke delivery callback
             deliveryCallback?.invoke(message)
-
         } catch (e: Exception) {
             println("Error processing inbound delivery: ${e.message}")
         }
@@ -1296,9 +1453,14 @@ class LXMRouter(
     /**
      * Pack app data for announcements.
      */
-    private fun packAnnounceAppData(displayName: String?, stampCost: Int): ByteArray {
+    private fun packAnnounceAppData(
+        displayName: String?,
+        stampCost: Int,
+    ): ByteArray {
         val buffer = java.io.ByteArrayOutputStream()
-        val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
+        val packer =
+            org.msgpack.core.MessagePack
+                .newDefaultPacker(buffer)
 
         packer.packArrayHeader(2)
 
@@ -1325,13 +1487,18 @@ class LXMRouter(
     /**
      * Handle a delivery announcement from a remote destination.
      */
-    fun handleDeliveryAnnounce(destHash: ByteArray, appData: ByteArray?) {
+    fun handleDeliveryAnnounce(
+        destHash: ByteArray,
+        appData: ByteArray?,
+    ) {
         if (appData == null || appData.isEmpty()) {
             return
         }
 
         try {
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(appData)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(appData)
             val arraySize = unpacker.unpackArrayHeader()
 
             if (arraySize >= 2) {
@@ -1370,28 +1537,32 @@ class LXMRouter(
     fun start() {
         if (running) return
 
+        // Load persisted propagation nodes from disk
+        loadPropagationNodes()
+
         running = true
         processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-        processingJob = processingScope?.launch {
-            while (running) {
-                try {
-                    processOutbound()
-                    processDeferredStamps()
+        processingJob =
+            processingScope?.launch {
+                while (running) {
+                    try {
+                        processOutbound()
+                        processDeferredStamps()
 
-                    // Periodic cleanup every 60 iterations (~240 seconds at 4s interval)
-                    processingCount++
-                    if (processingCount % 60 == 0L) {
-                        cleanTransientIdCaches()
-                        cleanOutboundStampCosts()
-                        cleanAvailableTickets()
+                        // Periodic cleanup every 60 iterations (~240 seconds at 4s interval)
+                        processingCount++
+                        if (processingCount % 60 == 0L) {
+                            cleanTransientIdCaches()
+                            cleanOutboundStampCosts()
+                            cleanAvailableTickets()
+                        }
+                    } catch (e: Exception) {
+                        println("Error in processing loop: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    println("Error in processing loop: ${e.message}")
+                    delay(PROCESSING_INTERVAL)
                 }
-                delay(PROCESSING_INTERVAL)
             }
-        }
     }
 
     /**
@@ -1409,34 +1580,28 @@ class LXMRouter(
     /**
      * Get the number of pending outbound messages.
      */
-    suspend fun pendingOutboundCount(): Int {
-        return pendingOutboundMutex.withLock {
+    suspend fun pendingOutboundCount(): Int =
+        pendingOutboundMutex.withLock {
             pendingOutbound.size
         }
-    }
 
     /**
      * Get the number of failed outbound messages.
      */
-    suspend fun failedOutboundCount(): Int {
-        return failedOutboundMutex.withLock {
+    suspend fun failedOutboundCount(): Int =
+        failedOutboundMutex.withLock {
             failedOutbound.size
         }
-    }
 
     /**
      * Get a registered delivery destination by hash.
      */
-    fun getDeliveryDestination(hexHash: String): DeliveryDestination? {
-        return deliveryDestinations[hexHash]
-    }
+    fun getDeliveryDestination(hexHash: String): DeliveryDestination? = deliveryDestinations[hexHash]
 
     /**
      * Get all registered delivery destinations.
      */
-    fun getDeliveryDestinations(): List<DeliveryDestination> {
-        return deliveryDestinations.values.toList()
-    }
+    fun getDeliveryDestinations(): List<DeliveryDestination> = deliveryDestinations.values.toList()
 
     /**
      * Set the inbound stamp cost for a registered delivery destination.
@@ -1448,13 +1613,17 @@ class LXMRouter(
      * @param cost The stamp cost (null to disable, 1-254 for PoW requirement)
      * @throws IllegalArgumentException if cost is out of range or destination not found
      */
-    fun setInboundStampCost(destinationHexHash: String, cost: Int?) {
+    fun setInboundStampCost(
+        destinationHexHash: String,
+        cost: Int?,
+    ) {
         if (cost != null && (cost < 1 || cost > 254)) {
             throw IllegalArgumentException("Stamp cost must be null or between 1 and 254, got $cost")
         }
 
-        val deliveryDest = deliveryDestinations[destinationHexHash]
-            ?: throw IllegalArgumentException("No delivery destination registered with hash $destinationHexHash")
+        val deliveryDest =
+            deliveryDestinations[destinationHexHash]
+                ?: throw IllegalArgumentException("No delivery destination registered with hash $destinationHexHash")
 
         deliveryDest.stampCost = cost
 
@@ -1466,7 +1635,10 @@ class LXMRouter(
     /**
      * Announce a delivery destination.
      */
-    fun announce(destination: Destination, appData: ByteArray? = null) {
+    fun announce(
+        destination: Destination,
+        appData: ByteArray? = null,
+    ) {
         destination.announce(appData)
     }
 
@@ -1482,13 +1654,19 @@ class LXMRouter(
      * @param identity The identity of the propagation node
      * @param appData The announcement app data (msgpack-encoded)
      */
-    fun handlePropagationAnnounce(destHash: ByteArray, identity: Identity, appData: ByteArray?) {
+    fun handlePropagationAnnounce(
+        destHash: ByteArray,
+        identity: Identity,
+        appData: ByteArray?,
+    ) {
         if (appData == null || appData.isEmpty()) {
             return
         }
 
         try {
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(appData)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(appData)
             val arraySize = unpacker.unpackArrayHeader()
 
             if (arraySize < 7) {
@@ -1500,24 +1678,26 @@ class LXMRouter(
             unpacker.skipValue()
 
             // [1] Timebase (int - unix timestamp)
-            val timebase = if (!unpacker.tryUnpackNil()) unpacker.unpackLong() else 0L
+            val timebase = if (!unpacker.tryUnpackNil()) unpackAsLong(unpacker) else 0L
 
             // [2] Node state (bool - active propagation node)
             val isActive = if (!unpacker.tryUnpackNil()) unpacker.unpackBoolean() else true
 
-            // [3] Per-transfer limit (int KB)
-            val perTransferLimit = if (!unpacker.tryUnpackNil()) {
-                unpacker.unpackInt()
-            } else {
-                LXMFConstants.PROPAGATION_LIMIT_KB
-            }
+            // [3] Per-transfer limit (int KB) — some nodes send as float
+            val perTransferLimit =
+                if (!unpacker.tryUnpackNil()) {
+                    unpackAsInt(unpacker)
+                } else {
+                    LXMFConstants.PROPAGATION_LIMIT_KB
+                }
 
-            // [4] Per-sync limit (int KB)
-            val perSyncLimit = if (!unpacker.tryUnpackNil()) {
-                unpacker.unpackInt()
-            } else {
-                LXMFConstants.SYNC_LIMIT_KB
-            }
+            // [4] Per-sync limit (int KB) — some nodes send as float
+            val perSyncLimit =
+                if (!unpacker.tryUnpackNil()) {
+                    unpackAsInt(unpacker)
+                } else {
+                    LXMFConstants.SYNC_LIMIT_KB
+                }
 
             // [5] Stamp cost list [cost, flexibility, peering_cost]
             var stampCost = LXMFConstants.PROPAGATION_COST
@@ -1526,9 +1706,9 @@ class LXMRouter(
 
             if (!unpacker.tryUnpackNil()) {
                 val costArraySize = unpacker.unpackArrayHeader()
-                if (costArraySize >= 1) stampCost = unpacker.unpackInt()
-                if (costArraySize >= 2) stampCostFlex = unpacker.unpackInt()
-                if (costArraySize >= 3) peeringCost = unpacker.unpackInt()
+                if (costArraySize >= 1) stampCost = unpackAsInt(unpacker)
+                if (costArraySize >= 2) stampCostFlex = unpackAsInt(unpacker)
+                if (costArraySize >= 3) peeringCost = unpackAsInt(unpacker)
             }
 
             // [6] Metadata (map with node name, etc.)
@@ -1554,22 +1734,23 @@ class LXMRouter(
             unpacker.close()
 
             // Create and store the propagation node
-            val node = PropagationNode(
-                destHash = destHash,
-                identity = identity,
-                displayName = displayName,
-                timebase = timebase,
-                isActive = isActive,
-                perTransferLimit = perTransferLimit,
-                perSyncLimit = perSyncLimit,
-                stampCost = stampCost,
-                stampCostFlexibility = stampCostFlex,
-                peeringCost = peeringCost
-            )
+            val node =
+                PropagationNode(
+                    destHash = destHash,
+                    identity = identity,
+                    displayName = displayName,
+                    timebase = timebase,
+                    isActive = isActive,
+                    perTransferLimit = perTransferLimit,
+                    perSyncLimit = perSyncLimit,
+                    stampCost = stampCost,
+                    stampCostFlexibility = stampCostFlex,
+                    peeringCost = peeringCost,
+                )
 
             propagationNodes[node.hexHash] = node
+            savePropagationNodes()
             println("Discovered propagation node: ${node.hexHash} (${displayName ?: "unnamed"})")
-
         } catch (e: Exception) {
             println("Error parsing propagation announce: ${e.message}")
         }
@@ -1582,10 +1763,29 @@ class LXMRouter(
      * @return True if the node was set successfully
      */
     fun setActivePropagationNode(destHashHex: String): Boolean {
-        val node = propagationNodes[destHashHex]
-        if (node == null || !node.isActive) {
-            println("Cannot set inactive or unknown propagation node: $destHashHex")
-            return false
+        var node = propagationNodes[destHashHex]
+
+        // If node isn't in the in-memory map (announce hasn't arrived yet),
+        // try to recall the identity from Transport and create a minimal entry.
+        // The full details will be populated when the announce arrives.
+        if (node == null) {
+            val destHash = destHashHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            val recalledIdentity = Identity.recall(destHash)
+            if (recalledIdentity != null) {
+                node =
+                    PropagationNode(
+                        destHash = destHash,
+                        identity = recalledIdentity,
+                        isActive = true,
+                    )
+                propagationNodes[destHashHex] = node
+                println("Created minimal propagation node entry from recalled identity: $destHashHex")
+            } else {
+                println("Cannot set propagation node: no announce and no recalled identity for $destHashHex")
+                // Still save the hash — the announce may arrive later
+                activePropagationNodeHash = destHashHex
+                return true
+            }
         }
 
         activePropagationNodeHash = destHashHex
@@ -1611,15 +1811,21 @@ class LXMRouter(
      */
     fun getActivePropagationNode(): PropagationNode? {
         val hash = activePropagationNodeHash ?: return null
-        return propagationNodes[hash]
+        propagationNodes[hash]?.let { return it }
+
+        // Node not in map — try late recall (identities may have loaded after setActive was called)
+        val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val identity = Identity.recall(destHash) ?: return null
+        val node = PropagationNode(destHash = destHash, identity = identity, isActive = true)
+        propagationNodes[hash] = node
+        println("Late-recalled propagation node identity for $hash")
+        return node
     }
 
     /**
      * Get all known propagation nodes.
      */
-    fun getPropagationNodes(): List<PropagationNode> {
-        return propagationNodes.values.filter { it.isActive }.toList()
-    }
+    fun getPropagationNodes(): List<PropagationNode> = propagationNodes.values.filter { it.isActive }.toList()
 
     /**
      * Add a propagation node directly to the known nodes map.
@@ -1644,7 +1850,7 @@ class LXMRouter(
         // Minimum accepted cost is (cost - flexibility), but at least PROPAGATION_COST_MIN
         return maxOf(
             LXMFConstants.PROPAGATION_COST_MIN,
-            node.stampCost - node.stampCostFlexibility
+            node.stampCost - node.stampCostFlexibility,
         )
     }
 
@@ -1661,8 +1867,14 @@ class LXMRouter(
     fun requestMessagesFromPropagationNode() {
         val node = getActivePropagationNode()
         if (node == null) {
+            // Identity not available yet — request path so it arrives for next cycle
+            val hash = activePropagationNodeHash
+            if (hash != null) {
+                val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                Transport.requestPath(destHash)
+                println("Propagation node identity not available, requested path for $hash")
+            }
             propagationTransferState = PropagationTransferState.FAILED
-            println("No active propagation node to request from")
             return
         }
 
@@ -1672,6 +1884,7 @@ class LXMRouter(
 
         // Check if we have an active link
         val link = outboundPropagationLink
+        println("[LXMRouter] requestMessages: link=${link != null}, status=${link?.status}, node=${node.hexHash.take(12)}")
         if (link != null && link.status == LinkConstants.ACTIVE) {
             propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
             requestMessageList(link)
@@ -1679,6 +1892,7 @@ class LXMRouter(
             // Need to establish link first
             establishPropagationLink(node)
         }
+        println("[LXMRouter] requestMessages: returning, state=$propagationTransferState")
     }
 
     /**
@@ -1692,59 +1906,70 @@ class LXMRouter(
      *                     (line 512) uses msg_request_established_callback that calls
      *                     request_messages_from_propagation_node.
      */
-    private fun establishPropagationLink(node: PropagationNode, forRetrieval: Boolean = true) {
+    private fun establishPropagationLink(
+        node: PropagationNode,
+        forRetrieval: Boolean = true,
+    ) {
         try {
             // Create destination for the propagation node
-            val destination = Destination.create(
-                identity = node.identity,
-                direction = DestinationDirection.OUT,
-                type = DestinationType.SINGLE,
-                appName = APP_NAME,
-                PROPAGATION_ASPECT
-            )
+            val destination =
+                Destination.create(
+                    identity = node.identity,
+                    direction = DestinationDirection.OUT,
+                    type = DestinationType.SINGLE,
+                    appName = APP_NAME,
+                    PROPAGATION_ASPECT,
+                )
+            println("establishPropagationLink: dest=${destination.hexHash}, hasPath=${Transport.hasPath(node.destHash)}")
 
-            val link = Link.create(
-                destination = destination,
-                establishedCallback = { establishedLink ->
-                    outboundPropagationLink = establishedLink
-                    propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
+            val link =
+                Link.create(
+                    destination = destination,
+                    establishedCallback = { establishedLink ->
+                        println("establishPropagationLink: LINK ESTABLISHED!")
+                        outboundPropagationLink = establishedLink
+                        propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
 
-                    // Identify ourselves on the link
-                    identifyOnLink(establishedLink)
+                        // Identify ourselves on the link
+                        identifyOnLink(establishedLink)
 
-                    if (forRetrieval) {
-                        // Retrieval path: request message list (Python line 510)
-                        requestMessageList(establishedLink)
-                    } else {
-                        // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
-                        processingScope?.launch {
-                            // Reset nextDeliveryAttempt for pending PROPAGATED messages so they get processed immediately.
-                            // This matches Python's behavior where process_outbound sends immediately when link is active,
-                            // without checking next_delivery_attempt (which was set when we initiated link establishment).
-                            pendingOutboundMutex.withLock {
-                                val now = System.currentTimeMillis()
-                                for (message in pendingOutbound) {
-                                    if (message.desiredMethod == DeliveryMethod.PROPAGATED && message.state == MessageState.OUTBOUND) {
-                                        message.nextDeliveryAttempt = now - 1  // Make eligible for immediate processing
+                        if (forRetrieval) {
+                            // Retrieval path: request message list (Python line 510)
+                            // The identify packet may not have been processed yet by the
+                            // remote node. If we get ERROR_NO_IDENTITY, handleMessageListResponse
+                            // will retry after a brief delay to let identify propagate.
+                            println("[LXMRouter] Calling requestMessageList on established link")
+                            requestMessageList(establishedLink)
+                        } else {
+                            // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
+                            processingScope?.launch {
+                                // Reset nextDeliveryAttempt for pending PROPAGATED messages so they get processed immediately.
+                                // This matches Python's behavior where process_outbound sends immediately when link is active,
+                                // without checking next_delivery_attempt (which was set when we initiated link establishment).
+                                pendingOutboundMutex.withLock {
+                                    val now = System.currentTimeMillis()
+                                    for (message in pendingOutbound) {
+                                        if (message.desiredMethod == DeliveryMethod.PROPAGATED && message.state == MessageState.OUTBOUND) {
+                                            message.nextDeliveryAttempt = now - 1 // Make eligible for immediate processing
+                                        }
                                     }
                                 }
+                                processOutbound()
                             }
-                            processOutbound()
                         }
-                    }
-                },
-                closedCallback = { _ ->
-                    if (propagationTransferState != PropagationTransferState.COMPLETE) {
-                        propagationTransferState = PropagationTransferState.NO_LINK
-                    }
-                    outboundPropagationLink = null
-                }
-            )
+                    },
+                    closedCallback = { _ ->
+                        if (propagationTransferState != PropagationTransferState.COMPLETE) {
+                            propagationTransferState = PropagationTransferState.NO_LINK
+                        }
+                        outboundPropagationLink = null
+                    },
+                )
 
             outboundPropagationLink = link
-
         } catch (e: Exception) {
             println("Failed to establish propagation link: ${e.message}")
+            e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
@@ -1754,50 +1979,82 @@ class LXMRouter(
      */
     private fun requestMessageList(link: Link) {
         propagationTransferState = PropagationTransferState.LISTING_MESSAGES
+        println("[LXMRouter] requestMessageList: link.status=${link.status}, path=${LXMFConstants.MESSAGE_GET_PATH}")
 
         try {
             // Send LIST request: [None, None]
             // Python sends [None, None] as data, which gets packed by Link.request
             val requestData = listOf(null, null)
 
-            link.request(
-                path = LXMFConstants.MESSAGE_GET_PATH,
-                data = requestData,
-                responseCallback = { receipt ->
-                    val responseData = receipt.response
-                    if (responseData != null) {
-                        handleMessageListResponse(link, responseData)
-                    } else {
+            val receipt =
+                link.request(
+                    path = LXMFConstants.MESSAGE_GET_PATH,
+                    data = requestData,
+                    responseCallback = { receipt ->
+                        val responseData = receipt.response
+                        println(
+                            "[LXMRouter] messageList response: size=${responseData?.size}, hex=${responseData?.take(
+                                20,
+                            )?.joinToString("") { "%02x".format(it) }}",
+                        )
+                        if (responseData != null) {
+                            handleMessageListResponse(link, responseData)
+                        } else {
+                            propagationTransferState = PropagationTransferState.FAILED
+                            println("[LXMRouter] Message list request returned null response")
+                        }
+                    },
+                    failedCallback = { _ ->
                         propagationTransferState = PropagationTransferState.FAILED
-                        println("Message list request returned null response")
-                    }
-                },
-                failedCallback = { _ ->
-                    propagationTransferState = PropagationTransferState.FAILED
-                    println("Message list request failed")
-                }
-            )
-
+                        println("Message list request failed")
+                    },
+                )
+            println("[LXMRouter] requestMessageList: receipt=$receipt")
         } catch (e: Exception) {
-            println("Failed to request message list: ${e.message}")
+            println("[LXMRouter] requestMessageList EXCEPTION: ${e.message}")
+            e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
 
+    /** Track retry count for message list requests (reset per sync cycle) */
+    private var messageListRetryCount = 0
+    private val MAX_MESSAGE_LIST_RETRIES = 3
+    private val MESSAGE_LIST_RETRY_DELAY_MS = 200L
+
     /**
      * Handle the message list response from a propagation node.
      */
-    private fun handleMessageListResponse(link: Link, response: ByteArray) {
+    private fun handleMessageListResponse(
+        link: Link,
+        response: ByteArray,
+    ) {
         try {
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(response)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(response)
 
-            // Check for error response
+            // Check for error response (Python returns int error codes)
             if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.INTEGER) {
                 val errorCode = unpacker.unpackInt()
-                println("Propagation node returned error: $errorCode")
-                propagationTransferState = PropagationTransferState.FAILED
+                // ERROR_NO_IDENTITY = identity not yet processed on remote.
+                // This happens when requestMessageList fires before the LINKIDENTIFY
+                // packet has been processed. Retry with backoff.
+                if (messageListRetryCount < MAX_MESSAGE_LIST_RETRIES) {
+                    messageListRetryCount++
+                    println("Propagation node returned error $errorCode, retrying ($messageListRetryCount/$MAX_MESSAGE_LIST_RETRIES)...")
+                    processingScope?.launch {
+                        kotlinx.coroutines.delay(MESSAGE_LIST_RETRY_DELAY_MS * messageListRetryCount)
+                        requestMessageList(link)
+                    }
+                } else {
+                    println("Propagation node returned error $errorCode after $MAX_MESSAGE_LIST_RETRIES retries")
+                    propagationTransferState = PropagationTransferState.FAILED
+                    messageListRetryCount = 0
+                }
                 return
             }
+            messageListRetryCount = 0
 
             // Response is list of transient_ids (just the IDs, no sizes)
             // Python's message_get_request returns [transient_id, transient_id, ...]
@@ -1828,7 +2085,6 @@ class LXMRouter(
 
             // Request the messages we want
             requestMessages(link, wantedIds)
-
         } catch (e: Exception) {
             println("Error parsing message list: ${e.message}")
             propagationTransferState = PropagationTransferState.FAILED
@@ -1838,17 +2094,21 @@ class LXMRouter(
     /**
      * Request specific messages from a propagation node.
      */
-    private fun requestMessages(link: Link, wantedIds: List<ByteArray>) {
+    private fun requestMessages(
+        link: Link,
+        wantedIds: List<ByteArray>,
+    ) {
         propagationTransferState = PropagationTransferState.REQUESTING_MESSAGES
 
         try {
             // Send GET request: [wants, haves, limit]
             // Python expects: data[0]=wants (list of transient IDs), data[1]=haves (list), data[2]=limit (int KB)
-            val requestData = listOf(
-                wantedIds,                       // wants: list of transient IDs (ByteArray)
-                emptyList<ByteArray>(),          // haves: empty list
-                LXMFConstants.DELIVERY_LIMIT_KB  // limit: KB limit
-            )
+            val requestData =
+                listOf(
+                    wantedIds, // wants: list of transient IDs (ByteArray)
+                    emptyList<ByteArray>(), // haves: empty list
+                    LXMFConstants.DELIVERY_LIMIT_KB, // limit: KB limit
+                )
 
             link.request(
                 path = LXMFConstants.MESSAGE_GET_PATH,
@@ -1856,7 +2116,7 @@ class LXMRouter(
                 responseCallback = { receipt ->
                     val responseData = receipt.response
                     if (responseData != null) {
-                        handleMessageGetResponse(responseData, wantedIds.size)
+                        handleMessageGetResponse(link, responseData, wantedIds.size)
                     } else {
                         propagationTransferState = PropagationTransferState.FAILED
                         println("Message get request returned null response")
@@ -1865,9 +2125,8 @@ class LXMRouter(
                 failedCallback = { _ ->
                     propagationTransferState = PropagationTransferState.FAILED
                     println("Message get request failed")
-                }
+                },
             )
-
         } catch (e: Exception) {
             println("Failed to request messages: ${e.message}")
             propagationTransferState = PropagationTransferState.FAILED
@@ -1877,11 +2136,17 @@ class LXMRouter(
     /**
      * Handle the message get response from a propagation node.
      */
-    private fun handleMessageGetResponse(response: ByteArray, expectedCount: Int) {
+    private fun handleMessageGetResponse(
+        link: Link,
+        response: ByteArray,
+        expectedCount: Int,
+    ) {
         propagationTransferState = PropagationTransferState.RECEIVING_MESSAGES
 
         try {
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(response)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(response)
 
             // Check for error response
             if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.INTEGER) {
@@ -1895,11 +2160,18 @@ class LXMRouter(
             // Python's message_get_request returns [lxmf_data, lxmf_data, ...]
             val messageCount = unpacker.unpackArrayHeader()
             var receivedCount = 0
+            val receivedHashes = mutableListOf<ByteArray>()
 
             for (i in 0 until messageCount) {
                 val dataLen = unpacker.unpackBinaryHeader()
                 val messageData = ByteArray(dataLen)
                 unpacker.readPayload(messageData)
+
+                // Track transient ID for deletion acknowledgment (Python line 1561)
+                receivedHashes.add(
+                    network.reticulum.crypto.Hashes
+                        .fullHash(messageData),
+                )
 
                 // Process the message
                 processInboundDelivery(messageData, DeliveryMethod.PROPAGATED)
@@ -1910,12 +2182,27 @@ class LXMRouter(
 
             unpacker.close()
 
+            // Send third request to acknowledge/delete received messages on the node
+            // Matches Python LXMRouter.py:1566-1572
+            if (receivedHashes.isNotEmpty()) {
+                try {
+                    link.request(
+                        path = LXMFConstants.MESSAGE_GET_PATH,
+                        data = listOf(null, receivedHashes),
+                        failedCallback = { _ ->
+                            println("Failed to send deletion acknowledgment to propagation node")
+                        },
+                    )
+                } catch (e: Exception) {
+                    println("Error sending deletion acknowledgment: ${e.message}")
+                }
+            }
+
             propagationTransferState = PropagationTransferState.COMPLETE
             propagationTransferProgress = 1.0
             propagationTransferLastResult = receivedCount
 
             println("Received $receivedCount messages from propagation node")
-
         } catch (e: Exception) {
             println("Error processing received messages: ${e.message}")
             propagationTransferState = PropagationTransferState.FAILED
@@ -1928,7 +2215,10 @@ class LXMRouter(
      * Update outbound stamp cost for a destination.
      * Matches Python LXMRouter.update_stamp_cost() (lines 977-982).
      */
-    private fun updateStampCost(destHashHex: String, stampCost: Int) {
+    private fun updateStampCost(
+        destHashHex: String,
+        stampCost: Int,
+    ) {
         val nowSeconds = System.currentTimeMillis() / 1000
         outboundStampCosts[destHashHex] = Pair(nowSeconds, stampCost)
         saveOutboundStampCostsAsync()
@@ -2025,7 +2315,10 @@ class LXMRouter(
      *
      * Matches Python LXMRouter.remember_ticket() (lines 1051-1054).
      */
-    private fun rememberTicket(sourceHashHex: String, ticketEntry: List<Any?>) {
+    private fun rememberTicket(
+        sourceHashHex: String,
+        ticketEntry: List<Any?>,
+    ) {
         if (ticketEntry.size < 2) return
         val expires = (ticketEntry[0] as? Number)?.toLong() ?: return
         val ticket = ticketEntry[1] as? ByteArray ?: return
@@ -2053,9 +2346,10 @@ class LXMRouter(
     private fun getInboundTickets(sourceHashHex: String): List<ByteArray>? {
         val tickets = inboundTickets[sourceHashHex] ?: return null
         val nowSeconds = System.currentTimeMillis() / 1000
-        val valid = tickets.entries
-            .filter { nowSeconds < it.value }
-            .map { hexToBytes(it.key) }
+        val valid =
+            tickets.entries
+                .filter { nowSeconds < it.value }
+                .map { hexToBytes(it.key) }
 
         return if (valid.isEmpty()) null else valid
     }
@@ -2456,13 +2750,12 @@ class LXMRouter(
     /**
      * Check if an identity is allowed to deliver messages.
      */
-    fun identityAllowed(identity: Identity): Boolean {
-        return if (authRequired) {
+    fun identityAllowed(identity: Identity): Boolean =
+        if (authRequired) {
             allowedList.any { it.contentEquals(identity.hash) }
         } else {
             true
         }
-    }
 
     // ===== Cleanup Jobs (Phase 6) =====
 
@@ -2476,9 +2769,10 @@ class LXMRouter(
         val nowSeconds = System.currentTimeMillis() / 1000
         val expiryThreshold = LXMFConstants.MESSAGE_EXPIRY * 6
 
-        val removed = locallyDeliveredTransientIds.entries.removeIf { (_, timestamp) ->
-            nowSeconds > timestamp + expiryThreshold
-        }
+        val removed =
+            locallyDeliveredTransientIds.entries.removeIf { (_, timestamp) ->
+                nowSeconds > timestamp + expiryThreshold
+            }
         if (removed) {
             saveTransientIdsAsync()
         }
@@ -2493,9 +2787,10 @@ class LXMRouter(
     private fun cleanOutboundStampCosts() {
         try {
             val nowSeconds = System.currentTimeMillis() / 1000
-            val removed = outboundStampCosts.entries.removeIf { (_, pair) ->
-                nowSeconds > pair.first + LXMFConstants.STAMP_COST_EXPIRY
-            }
+            val removed =
+                outboundStampCosts.entries.removeIf { (_, pair) ->
+                    nowSeconds > pair.first + LXMFConstants.STAMP_COST_EXPIRY
+                }
             if (removed) {
                 saveOutboundStampCostsAsync()
             }
@@ -2558,9 +2853,11 @@ class LXMRouter(
             }
 
             // Decode: remove protocol, remove slashes, add padding, base64url-decode
-            val encoded = uri.removePrefix(schema)
-                .replace(LXMFConstants.URI_SCHEMA + "://", "")
-                .replace("/", "") + "=="
+            val encoded =
+                uri
+                    .removePrefix(schema)
+                    .replace(LXMFConstants.URI_SCHEMA + "://", "")
+                    .replace("/", "") + "=="
 
             val lxmfData = Base64.getUrlDecoder().decode(encoded)
             val transientId = Hashes.fullHash(lxmfData)
@@ -2577,7 +2874,6 @@ class LXMRouter(
 
             println("[LXMRouter] Ingested paper message with transient ID ${transientIdHex.take(12)}")
             return true
-
         } catch (e: Exception) {
             println("[LXMRouter] Error decoding URI-encoded LXMF message: ${e.message}")
             return false
@@ -2599,4 +2895,143 @@ class LXMRouter(
         }
         return data
     }
+
+    // ===== Propagation Node Persistence =====
+
+    private fun getPropagationNodesFile(): java.io.File? {
+        val path = storagePath ?: return null
+        val dir = java.io.File(path, "lxmf")
+        if (!dir.exists()) dir.mkdirs()
+        return java.io.File(dir, "propagation_nodes")
+    }
+
+    private fun savePropagationNodes() {
+        val file = getPropagationNodesFile() ?: return
+        try {
+            val buffer = java.io.ByteArrayOutputStream()
+            val packer =
+                org.msgpack.core.MessagePack
+                    .newDefaultPacker(buffer)
+            val nodes = propagationNodes.values.toList()
+            packer.packMapHeader(nodes.size)
+            for (node in nodes) {
+                packer.packString(node.hexHash)
+                packer.packMapHeader(8)
+                packer.packString("dest_hash")
+                packer.packBinaryHeader(node.destHash.size)
+                packer.writePayload(node.destHash)
+                packer.packString("identity_pub")
+                packer.packBinaryHeader(node.identity.getPublicKey().size)
+                packer.writePayload(node.identity.getPublicKey())
+                packer.packString("display_name")
+                if (node.displayName != null) packer.packString(node.displayName!!) else packer.packNil()
+                packer.packString("timebase")
+                packer.packLong(node.timebase)
+                packer.packString("is_active")
+                packer.packBoolean(node.isActive)
+                packer.packString("per_transfer_limit")
+                packer.packInt(node.perTransferLimit)
+                packer.packString("per_sync_limit")
+                packer.packInt(node.perSyncLimit)
+                packer.packString("stamp_cost")
+                packer.packInt(node.stampCost)
+            }
+            packer.close()
+            file.writeBytes(buffer.toByteArray())
+            println("Saved ${nodes.size} propagation nodes to ${file.name}")
+        } catch (e: Exception) {
+            println("Error saving propagation nodes: ${e.message}")
+        }
+    }
+
+    private fun loadPropagationNodes() {
+        val file = getPropagationNodesFile() ?: return
+        if (!file.exists()) return
+        try {
+            val data = file.readBytes()
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(data)
+            val mapSize = unpacker.unpackMapHeader()
+            var loaded = 0
+            for (i in 0 until mapSize) {
+                val hexHash = unpacker.unpackString()
+                val fieldCount = unpacker.unpackMapHeader()
+                var destHash: ByteArray? = null
+                var pubKey: ByteArray? = null
+                var displayName: String? = null
+                var timebase = 0L
+                var isActive = true
+                var perTransferLimit = LXMFConstants.PROPAGATION_LIMIT_KB
+                var perSyncLimit = LXMFConstants.SYNC_LIMIT_KB
+                var stampCost = LXMFConstants.PROPAGATION_COST
+
+                for (j in 0 until fieldCount) {
+                    val key = unpacker.unpackString()
+                    when (key) {
+                        "dest_hash" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            destHash = ByteArray(len)
+                            unpacker.readPayload(destHash)
+                        }
+                        "identity_pub" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            pubKey = ByteArray(len)
+                            unpacker.readPayload(pubKey)
+                        }
+                        "display_name" -> displayName = if (!unpacker.tryUnpackNil()) unpacker.unpackString() else null
+                        "timebase" -> timebase = unpackAsLong(unpacker)
+                        "is_active" -> isActive = unpacker.unpackBoolean()
+                        "per_transfer_limit" -> perTransferLimit = unpackAsInt(unpacker)
+                        "per_sync_limit" -> perSyncLimit = unpackAsInt(unpacker)
+                        "stamp_cost" -> stampCost = unpackAsInt(unpacker)
+                        else -> unpacker.skipValue()
+                    }
+                }
+
+                if (destHash != null && pubKey != null) {
+                    val identity = Identity.fromPublicKey(pubKey)
+                    val node =
+                        PropagationNode(
+                            destHash = destHash,
+                            identity = identity,
+                            displayName = displayName,
+                            timebase = timebase,
+                            isActive = isActive,
+                            perTransferLimit = perTransferLimit,
+                            perSyncLimit = perSyncLimit,
+                            stampCost = stampCost,
+                        )
+                    propagationNodes[hexHash] = node
+                    loaded++
+                }
+            }
+            unpacker.close()
+            println("Loaded $loaded propagation nodes from ${file.name}")
+        } catch (e: Exception) {
+            println("Error loading propagation nodes: ${e.message}")
+        }
+    }
+
+    /** Unpack a msgpack value as Int, tolerating float encoding. Matches Python's int() coercion. */
+    private fun unpackAsInt(unpacker: org.msgpack.core.MessageUnpacker): Int =
+        when (unpacker.nextFormat.valueType) {
+            org.msgpack.value.ValueType.INTEGER -> unpacker.unpackInt()
+            org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble().toInt()
+            else -> {
+                unpacker.skipValue()
+                0
+            }
+        }
+
+    /** Unpack a msgpack value as Long, tolerating float encoding. */
+    private fun unpackAsLong(unpacker: org.msgpack.core.MessageUnpacker): Long =
+        when (unpacker.nextFormat.valueType) {
+            org.msgpack.value.ValueType.INTEGER -> unpacker.unpackLong()
+            org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble().toLong()
+            else -> {
+                unpacker.skipValue()
+                0L
+            }
+        }
 }

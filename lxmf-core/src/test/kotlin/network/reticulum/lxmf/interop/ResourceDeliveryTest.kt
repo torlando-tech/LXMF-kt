@@ -12,7 +12,10 @@ import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
 import network.reticulum.lxmf.MessageRepresentation
 import network.reticulum.lxmf.MessageState
+import org.junit.jupiter.api.MethodOrderer
+import org.junit.jupiter.api.Order
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestMethodOrder
 import org.junit.jupiter.api.Timeout
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -31,7 +34,11 @@ import kotlin.time.Duration.Companion.seconds
  * - Content > 319 bytes: RESOURCE representation
  *
  * Resource protocol verified working bidirectionally (Phase 9.3).
+ *
+ * Test order matters: K→P resource delivery must run before P→K to avoid
+ * stale link state from the P→K link interfering with K→P resource proofs.
  */
+@TestMethodOrder(MethodOrderer.OrderAnnotation::class)
 class ResourceDeliveryTest : DirectDeliveryTestBase() {
 
     private val receivedMessages = CopyOnWriteArrayList<LXMessage>()
@@ -75,6 +82,7 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     // These tests use empty title to test the exact boundary.
 
     @Test
+    @Order(1)
     @Timeout(60, unit = TimeUnit.SECONDS)
     fun `message at 319 bytes content uses PACKET representation`() = runBlocking {
         println("\n=== THRESHOLD TEST: 319 bytes -> PACKET ===\n")
@@ -104,6 +112,7 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     }
 
     @Test
+    @Order(2)
     @Timeout(60, unit = TimeUnit.SECONDS)
     fun `message at 320 bytes content uses RESOURCE representation`() = runBlocking {
         println("\n=== THRESHOLD TEST: 320 bytes -> RESOURCE ===\n")
@@ -141,6 +150,7 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     // 3. Content integrity is preserved
 
     @Test
+    @Order(3)
     @Timeout(90, unit = TimeUnit.SECONDS)
     fun `Kotlin can send large message to Python via RESOURCE transfer`() = runBlocking {
         println("\n=== KOTLIN -> PYTHON RESOURCE DELIVERY TEST ===\n")
@@ -179,9 +189,10 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
 
         kotlinRouter.handleOutbound(message)
 
-        // Wait for message to progress past OUTBOUND (indicates delivery attempt started)
-        val progressedPastOutbound = withTimeoutOrNull(30.seconds) {
-            while (message.state == MessageState.GENERATING || message.state == MessageState.OUTBOUND) {
+        // Wait for message to reach DELIVERED state (resource proof received)
+        // Resource transfers need time: link establishment + data transfer + proof round-trip
+        val delivered = withTimeoutOrNull(30.seconds) {
+            while (!callbackFired.get() && message.state != MessageState.DELIVERED) {
                 delay(200)
             }
             true
@@ -218,6 +229,7 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     }
 
     @Test
+    @Order(4)
     @Timeout(90, unit = TimeUnit.SECONDS)
     fun `Python can send large message to Kotlin via RESOURCE transfer`() = runBlocking {
         println("\n=== PYTHON -> KOTLIN RESOURCE DELIVERY TEST ===\n")
@@ -262,6 +274,7 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     }
 
     @Test
+    @Order(5)
     @Timeout(120, unit = TimeUnit.SECONDS)
     fun `bidirectional large message delivery works`() = runBlocking {
         println("\n=== BIDIRECTIONAL RESOURCE DELIVERY TEST ===\n")
@@ -292,11 +305,8 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
 
         kotlinRouter.handleOutbound(k2pMessage)
 
-        // Wait for progress
-        delay(5000)
-
-        // Check if Python received
-        val pythonReceived = withTimeoutOrNull(25.seconds) {
+        // Wait for Python to receive the message
+        val pythonReceived = withTimeoutOrNull(30.seconds) {
             var messages = getPythonMessages()
             while (messages.isEmpty()) {
                 delay(500)
