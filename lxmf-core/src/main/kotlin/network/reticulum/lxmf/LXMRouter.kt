@@ -58,6 +58,13 @@ class LXMRouter(
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
 
+        /**
+         * Retry pending direct links after this long.
+         * This prevents a link request sent before path discovery completes
+         * from remaining stuck in PENDING for the full link watchdog timeout.
+         */
+        const val PENDING_LINK_RETRY_TIMEOUT = 15000L
+
         /** Maximum pathless delivery attempts before requesting path */
         const val MAX_PATHLESS_TRIES = 1
 
@@ -114,8 +121,8 @@ class LXMRouter(
     /** Backchannel links for replies: destination_hash -> Link */
     private val backchannelLinks = ConcurrentHashMap<String, Link>()
 
-    /** Destinations with pending link establishments */
-    private val pendingLinkEstablishments = ConcurrentHashMap.newKeySet<String>()
+    /** Destinations with pending link establishments: destination_hash -> started_at_ms */
+    private val pendingLinkEstablishments = ConcurrentHashMap<String, Long>()
 
     /** Pending resource transfers: message_hash -> (message, resource) */
     private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
@@ -774,8 +781,22 @@ class LXMRouter(
             }
 
             link != null && link.status == LinkConstants.PENDING -> {
-                // Link is being established, wait
-                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                val pendingSince = pendingLinkEstablishments[destHashHex]
+                val pendingAge = pendingSince?.let { System.currentTimeMillis() - it } ?: 0L
+                val hasPathNow = Transport.hasPath(message.destinationHash)
+
+                if (hasPathNow && pendingAge >= PENDING_LINK_RETRY_TIMEOUT) {
+                    println(
+                        "[LXMRouter] processDirectDelivery: pending link for $destHashHex has been stuck for ${pendingAge}ms; tearing down and re-establishing now that a path exists",
+                    )
+                    directLinks.remove(destHashHex)
+                    pendingLinkEstablishments.remove(destHashHex)
+                    link.teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
+                    establishLinkForMessage(message)
+                } else {
+                    // Link is being established, wait
+                    message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                }
             }
 
             link != null && link.status == LinkConstants.CLOSED -> {
@@ -806,12 +827,12 @@ class LXMRouter(
         val destHashHex = message.destinationHash.toHexString()
 
         // Check if we're already establishing a link
-        if (pendingLinkEstablishments.contains(destHashHex)) {
+        if (pendingLinkEstablishments.containsKey(destHashHex)) {
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             return
         }
 
-        pendingLinkEstablishments.add(destHashHex)
+        pendingLinkEstablishments[destHashHex] = System.currentTimeMillis()
 
         try {
             // Create the link
