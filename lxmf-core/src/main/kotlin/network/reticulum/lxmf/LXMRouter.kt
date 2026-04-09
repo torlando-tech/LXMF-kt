@@ -1093,6 +1093,11 @@ class LXMRouter(
 
             // Track the resource
             val messageHashHex = message.hash?.toHexString() ?: ""
+            resource.callbacks.failed = {
+                pendingResources.remove(messageHashHex)
+                message.state = MessageState.FAILED
+                message.failedCallback?.invoke(message)
+            }
             pendingResources[messageHashHex] = Pair(message, resource)
         } catch (e: Exception) {
             println("Failed to send via propagation: ${e.message}")
@@ -1167,6 +1172,11 @@ class LXMRouter(
                             message.progress = progressResource.progress.toDouble()
                         },
                     )
+                resource.callbacks.failed = {
+                    pendingResources.remove(messageHashHex)
+                    message.state = MessageState.FAILED
+                    message.failedCallback?.invoke(message)
+                }
 
                 // Track resource for completion
                 pendingResources[messageHashHex] = Pair(message, resource)
