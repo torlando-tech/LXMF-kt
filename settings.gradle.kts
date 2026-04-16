@@ -11,6 +11,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven { url = uri("https://jitpack.io") }
     }
 }
 
@@ -18,5 +19,3 @@ rootProject.name = "lxmf-kt"
 
 include(":lxmf-core")
 include(":lxmf-examples")
-
-includeBuild("reticulum-kt")
