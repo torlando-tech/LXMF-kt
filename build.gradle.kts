@@ -4,8 +4,8 @@ plugins {
 }
 
 allprojects {
-    group = "network.reticulum"
-    version = "0.1.0-SNAPSHOT"
+    group = "com.github.torlando-tech.LXMF-kt"
+    version = System.getenv("VERSION")?.removePrefix("v") ?: "0.1.0-SNAPSHOT"
 }
 
 subprojects {
