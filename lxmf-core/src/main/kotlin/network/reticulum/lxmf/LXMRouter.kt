@@ -246,13 +246,15 @@ class LXMRouter(
         // Register announce handler for propagation nodes
         // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
         // so we handle all announces and let handlePropagationAnnounce filter by appData format.
-        Transport.registerAnnounceHandler { destHash, identity, appData ->
-            // Only call handler if this looks like a propagation announce (has appData)
-            if (appData != null && appData.isNotEmpty()) {
-                handlePropagationAnnounce(destHash, identity, appData)
+        Transport.registerAnnounceHandler(
+            network.reticulum.transport.AnnounceHandler { destHash, identity, appData ->
+                // Only call handler if this looks like a propagation announce (has appData)
+                if (appData != null && appData.isNotEmpty()) {
+                    handlePropagationAnnounce(destHash, identity, appData)
+                }
+                false // Don't consume - let other handlers see it too
             }
-            false // Don't consume - let other handlers see it too
-        }
+        )
     }
 
     /**

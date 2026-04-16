@@ -1,6 +1,6 @@
 plugins {
-    kotlin("jvm") version "1.9.22" apply false
-    kotlin("plugin.serialization") version "1.9.22" apply false
+    kotlin("jvm") version "2.3.0" apply false
+    kotlin("plugin.serialization") version "2.3.0" apply false
 }
 
 allprojects {
@@ -10,9 +10,9 @@ allprojects {
 
 subprojects {
     tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
-        kotlinOptions {
-            jvmTarget = "21"
-            freeCompilerArgs = listOf("-Xjsr305=strict")
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+            freeCompilerArgs.add("-Xjsr305=strict")
         }
     }
 
