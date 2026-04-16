@@ -16,8 +16,11 @@ val junitVersion: String by project
 val kotestVersion: String by project
 
 dependencies {
-    // Depend on rns-core for Reticulum functionality
-    implementation("com.github.torlando-tech.reticulum-kt:rns-core:v0.0.3")
+    // Depend on rns-core for Reticulum functionality.
+    // api scope: lxmf-core's public API (LXMRouter, LXMessage) exposes
+    // rns-core types (Destination, Identity) as parameters and return types,
+    // so consumers need rns-core on their compile classpath.
+    api("com.github.torlando-tech.reticulum-kt:rns-core:v0.0.3")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
