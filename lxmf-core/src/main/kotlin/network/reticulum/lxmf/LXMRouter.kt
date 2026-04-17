@@ -359,11 +359,15 @@ class LXMRouter(
                 DELIVERY_ASPECT,
             )
 
-        // Enable ratchets for forward secrecy
-        // Fixed: The issue was that destinations were incorrectly storing ratchet public keys
-        // under their own hash, confusing the encryption/decryption logic.
+        // Enable ratchets for forward secrecy. Filename matches the Python LXMF
+        // reference (`<hash>.ratchets`) so a ratchet directory copied from
+        // Sideband / reference-Python installs is readable without a rename
+        // step. Legacy LXMF-kt installs wrote the same blob without a suffix;
+        // `migrateLegacyRatchetFiles` below handles the one-time rename.
         storagePath?.let { path ->
-            val ratchetPath = "$path/lxmf/ratchets/${destination.hexHash}"
+            val ratchetsDir = java.io.File("$path/lxmf/ratchets")
+            migrateLegacyRatchetFiles(ratchetsDir, destination.hexHash)
+            val ratchetPath = java.io.File(ratchetsDir, "${destination.hexHash}.ratchets").absolutePath
             destination.enableRatchets(ratchetPath)
         }
 
@@ -2894,6 +2898,29 @@ class LXMRouter(
             i += 2
         }
         return data
+    }
+
+    /**
+     * Earlier LXMF-kt revisions wrote per-destination ratchet blobs to
+     * `$path/lxmf/ratchets/<hash>` with no suffix, diverging from Python
+     * LXMF's `<hash>.ratchets`. This renames any legacy file for the current
+     * destination to the suffixed filename on next-boot, so an upgrading
+     * consumer keeps its ratchet state instead of silently starting fresh.
+     *
+     * Scoped to the specific destination we're enabling so we touch the
+     * filesystem only when actually preparing ratchets for that destination.
+     * Best-effort: failure here just means the destination regenerates a
+     * ratchet, which is forward-secrecy safe.
+     */
+    private fun migrateLegacyRatchetFiles(
+        ratchetsDir: java.io.File,
+        hexHash: String,
+    ) {
+        if (!ratchetsDir.exists() || !ratchetsDir.isDirectory) return
+        val legacy = java.io.File(ratchetsDir, hexHash)
+        val modern = java.io.File(ratchetsDir, "$hexHash.ratchets")
+        if (!legacy.isFile || modern.exists()) return
+        runCatching { legacy.renameTo(modern) }
     }
 
     // ===== Propagation Node Persistence =====
