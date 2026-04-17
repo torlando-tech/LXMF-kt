@@ -365,9 +365,9 @@ class LXMRouter(
         // step. Legacy LXMF-kt installs wrote the same blob without a suffix;
         // `migrateLegacyRatchetFiles` below handles the one-time rename.
         storagePath?.let { path ->
-            val ratchetsDir = java.io.File("$path/lxmf/ratchets")
+            val ratchetsDir = File("$path/lxmf/ratchets")
             migrateLegacyRatchetFiles(ratchetsDir, destination.hexHash)
-            val ratchetPath = java.io.File(ratchetsDir, "${destination.hexHash}.ratchets").absolutePath
+            val ratchetPath = File(ratchetsDir, "${destination.hexHash}.ratchets").absolutePath
             destination.enableRatchets(ratchetPath)
         }
 
@@ -2913,14 +2913,18 @@ class LXMRouter(
      * ratchet, which is forward-secrecy safe.
      */
     private fun migrateLegacyRatchetFiles(
-        ratchetsDir: java.io.File,
+        ratchetsDir: File,
         hexHash: String,
     ) {
         if (!ratchetsDir.exists() || !ratchetsDir.isDirectory) return
-        val legacy = java.io.File(ratchetsDir, hexHash)
-        val modern = java.io.File(ratchetsDir, "$hexHash.ratchets")
+        val legacy = File(ratchetsDir, hexHash)
+        val modern = File(ratchetsDir, "$hexHash.ratchets")
         if (!legacy.isFile || modern.exists()) return
-        runCatching { legacy.renameTo(modern) }
+        // renameTo returns false on failure (e.g. cross-filesystem move on
+        // Android) rather than throwing, so no try/catch is needed. Discarded
+        // intentionally — if the rename doesn't stick, Destination will just
+        // generate a fresh ratchet, which is forward-secrecy safe.
+        legacy.renameTo(modern)
     }
 
     // ===== Propagation Node Persistence =====
