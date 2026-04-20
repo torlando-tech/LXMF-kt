@@ -1458,13 +1458,17 @@ class LXMRouter(
             // context is lost; the sync link's values would refer to the
             // propagation node, not the original sender, and would be
             // misleading. (See LXMessage.receivedRssi KDoc.)
+            //
+            // `receivingInterfaceHash` is defensively copied on assignment
+            // so that neither a caller mutating the delivered field nor the
+            // RNS layer recycling a buffer can leak across the boundary.
             if (method != DeliveryMethod.PROPAGATED) {
                 if (sourcePacket != null) {
                     // Single-packet path (OPPORTUNISTIC or small DIRECT): the
                     // delivering packet carries authoritative phy metadata.
                     message.receivedRssi = sourcePacket.rssi
                     message.receivedSnr = sourcePacket.snr
-                    message.receivingInterfaceHash = sourcePacket.receivingInterfaceHash
+                    message.receivingInterfaceHash = sourcePacket.receivingInterfaceHash?.copyOf()
                     message.receivedHopCount = sourcePacket.hops
                 } else if (link != null) {
                     // Resource-delivered path: no single source packet is
@@ -1478,7 +1482,7 @@ class LXMRouter(
                     // enabled on the link by the caller.
                     message.receivedRssi = link.getRssi()
                     message.receivedSnr = link.getSnr()
-                    message.receivingInterfaceHash = link.attachedInterfaceHash
+                    message.receivingInterfaceHash = link.attachedInterfaceHash?.copyOf()
                     // Every constituent packet of a Resource traverses the
                     // same hop path as the link itself, so expectedHops is
                     // the correct hop count for the delivered message.

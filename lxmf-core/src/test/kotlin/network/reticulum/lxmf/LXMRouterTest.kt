@@ -648,6 +648,137 @@ class LXMRouterTest {
         assertNull(delivered.receivedHopCount, "PROPAGATED must leave receivedHopCount null")
     }
 
+    /**
+     * Reflectively stamp a [Link] with phy stats as if they had been
+     * captured from the last inbound Resource packet. The `trackPhyStats`
+     * flag must be enabled for `getRssi()`/`getSnr()` to return non-null.
+     */
+    private fun setLinkField(link: network.reticulum.link.Link, fieldName: String, value: Any?) {
+        val field = network.reticulum.link.Link::class.java.getDeclaredField(fieldName)
+        field.isAccessible = true
+        field.set(link, value)
+    }
+
+    @Test
+    fun `resource-delivered path annotates LXMessage from link phy stats`() {
+        // Covers the Resource-delivered (multi-packet) DIRECT case: no
+        // sourcePacket is available in handleResourceConcluded, so the
+        // annotation block falls through to the link branch. Previously
+        // this code path was only validated by inspection — now an actual
+        // test exercises link.getRssi/getSnr/attachedInterfaceHash/
+        // expectedHops as production does.
+        val received = CopyOnWriteArrayList<LXMessage>()
+        router.registerDeliveryCallback { received.add(it) }
+
+        val destinationIdentity = Identity.create()
+        router.registerDeliveryIdentity(destinationIdentity, "ResourceNode")
+
+        // Build a valid packed LXMF message. Source identity is remembered
+        // so unpackFromBytes can validate the signature.
+        val packedMessage = packMessageTo(destinationIdentity, "resource payload")
+
+        // Create a real Link and prepare it to look like one that has
+        // accumulated phy stats from Resource constituent packets. We need
+        // a destination whose identity has a private key for Link.create
+        // to succeed.
+        val peerIdentity = Identity.create()
+        val peerDestination = Destination.create(
+            identity = peerIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val link = network.reticulum.link.Link.create(peerDestination)
+
+        val expectedRssi = -95
+        val expectedSnr = 2.25f
+        val expectedHops = 4
+        val expectedIfaceHash = ByteArray(16) { (0xC0 + it).toByte() }
+
+        setLinkField(link, "trackPhyStats", true)
+        setLinkField(link, "phyRssi", expectedRssi)
+        setLinkField(link, "phySnr", expectedSnr)
+        link.attachedInterfaceHash = expectedIfaceHash
+        setLinkField(link, "expectedHops", expectedHops)
+
+        // The handleResourceConcluded path calls processInboundDelivery
+        // with (data, DIRECT, null, link, sourcePacket=null). We invoke it
+        // directly via reflection because spinning up a full Resource
+        // transfer in a unit test is infeasible, but the production
+        // annotation block is exercised end-to-end.
+        val processInbound = LXMRouter::class.java.getDeclaredMethod(
+            "processInboundDelivery",
+            ByteArray::class.java,
+            DeliveryMethod::class.java,
+            Destination::class.java,
+            network.reticulum.link.Link::class.java,
+            Packet::class.java
+        )
+        processInbound.isAccessible = true
+        processInbound.invoke(router, packedMessage, DeliveryMethod.DIRECT, null, link, null)
+
+        assertEquals(1, received.size)
+        val delivered = received[0]
+        assertEquals("resource payload", delivered.content)
+        assertEquals(DeliveryMethod.DIRECT, delivered.method)
+        // Tight equality on each of the four fields: a regression that
+        // wires only hops (or only rssi) would fail distinctly.
+        assertEquals(expectedRssi, delivered.receivedRssi)
+        assertEquals(expectedSnr, delivered.receivedSnr)
+        assertEquals(expectedHops, delivered.receivedHopCount)
+        assertNotNull(delivered.receivingInterfaceHash)
+        assertTrue(
+            expectedIfaceHash.contentEquals(delivered.receivingInterfaceHash!!),
+            "Interface hash on delivered LXMessage should equal link.attachedInterfaceHash"
+        )
+        // Defensive-copy invariant: the delivered message's interface hash
+        // must not be the same ByteArray instance as the link's (mutating
+        // one must not bleed into the other). If we ever drop the copyOf()
+        // at the annotation site, this assertion fails loudly.
+        assertTrue(
+            delivered.receivingInterfaceHash !== link.attachedInterfaceHash,
+            "Delivered receivingInterfaceHash must be a defensive copy, not a reference"
+        )
+    }
+
+    @Test
+    fun `opportunistic delivery defensively copies receivingInterfaceHash`() {
+        // Companion invariant for the packet-based branch: same defensive
+        // copy requirement as the link-based branch above. If the RNS
+        // layer reuses a buffer for receivingInterfaceHash, mutations must
+        // not reach the LXMessage after delivery.
+        val received = CopyOnWriteArrayList<LXMessage>()
+        router.registerDeliveryCallback { received.add(it) }
+
+        val destinationIdentity = Identity.create()
+        val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "DefensiveCopyNode")
+        val packedMessage = packMessageTo(destinationIdentity, "copy-check payload")
+        val afterDestHash = packedMessage.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedMessage.size)
+
+        val originalIface = ByteArray(16) { (it + 1).toByte() }
+        val packet = Packet.createRaw(
+            destinationHash = deliveryDest.hash,
+            data = afterDestHash
+        )
+        packet.hops = 1
+        setPacketField(packet, "receivingInterfaceHash", originalIface)
+        setPacketField(packet, "destination", deliveryDest)
+
+        deliveryDest.packetCallback!!.invoke(afterDestHash, packet)
+
+        assertEquals(1, received.size)
+        val delivered = received[0]
+        assertNotNull(delivered.receivingInterfaceHash)
+        // Content matches...
+        assertTrue(originalIface.contentEquals(delivered.receivingInterfaceHash!!))
+        // ...but it's a defensive copy, not an aliased reference.
+        assertTrue(
+            delivered.receivingInterfaceHash !== originalIface,
+            "Delivered receivingInterfaceHash must be a defensive copy of the packet's buffer"
+        )
+    }
+
     @Test
     fun `opportunistic delivery with null packet phy stats leaves metadata null`() {
         // Companion case to the happy path: a packet that carried no phy
