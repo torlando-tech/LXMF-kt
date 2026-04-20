@@ -5,11 +5,14 @@ import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.packet.Packet
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -440,6 +443,247 @@ class LXMRouterTest {
     fun `test get outbound propagation cost without active node`() {
         val cost = router.getOutboundPropagationCost()
         assertEquals(null, cost)
+    }
+
+    // ---------------------------------------------------------------------
+    // Receive-time packet-metadata annotation (LXMF-kt issue #9).
+    //
+    // These tests exercise the end-to-end opportunistic delivery path:
+    // router.registerDeliveryIdentity installs destination.packetCallback,
+    // which then dispatches to handleDeliveryPacket -> processInboundDelivery
+    // and finally invokes the user-registered deliveryCallback with an
+    // LXMessage. We construct a real Packet, stamp it with deterministic
+    // phy metadata (rssi/snr/hops/receivingInterfaceHash), invoke the
+    // destination's packetCallback with that packet, and assert the
+    // delivered LXMessage carries the metadata.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Produce the wire bytes of an LXMF message (destHash + sourceHash +
+     * signature + msgpackPayload) destined to [destinationIdentity].
+     */
+    private fun packMessageTo(destinationIdentity: Identity, body: String): ByteArray {
+        val sourceIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = sourceIdentity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val destDestination = Destination.create(
+            identity = destinationIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        // Remember the source identity so the router's signature-validation
+        // path can recall it during unpackFromBytes. Without this, signatures
+        // come back SOURCE_UNKNOWN but the router still delivers the
+        // message — we want the happy path.
+        Identity.remember(
+            packetHash = ByteArray(32) { it.toByte() },
+            destHash = sourceDestination.hash,
+            publicKey = sourceIdentity.getPublicKey()
+        )
+
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = body,
+            title = "Test"
+        )
+        return message.pack()
+    }
+
+    /**
+     * Forcibly set a [Packet] field whose setter is marked `internal` to
+     * the rns-core module (rssi, snr, receivingInterfaceHash, destination).
+     * We can't set these from outside rns-core without reflection, but the
+     * production code in LXMRouter reads them via the public getter, so
+     * the behavior under test is exercised as in prod.
+     */
+    private fun <T> setPacketField(packet: Packet, fieldName: String, value: T?) {
+        val field = Packet::class.java.getDeclaredField(fieldName)
+        field.isAccessible = true
+        field.set(packet, value)
+    }
+
+    @Test
+    fun `opportunistic delivery annotates LXMessage with packet phy metadata`() {
+        val received = CopyOnWriteArrayList<LXMessage>()
+        router.registerDeliveryCallback { received.add(it) }
+
+        val destinationIdentity = Identity.create()
+        val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "MetaNode")
+        val packedMessage = packMessageTo(destinationIdentity, "payload under test")
+
+        // The destination packet callback (installed by LXMRouter) strips the
+        // destHash and re-prepends it inside handleDeliveryPacket, so the
+        // packet's `data` here should be everything AFTER the dest hash.
+        val afterDestHash = packedMessage.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedMessage.size)
+
+        val expectedRssi = -80
+        val expectedSnr = 7.5f
+        val expectedHops = 3
+        val expectedIfaceHash = ByteArray(16) { (0xA0 + it).toByte() }
+
+        val packet = Packet.createRaw(
+            destinationHash = deliveryDest.hash,
+            data = afterDestHash
+        )
+        packet.hops = expectedHops
+        setPacketField(packet, "rssi", expectedRssi)
+        setPacketField(packet, "snr", expectedSnr)
+        setPacketField(packet, "receivingInterfaceHash", expectedIfaceHash)
+        // `packet.destination` has `internal set`; assign it so that the
+        // router's `packet.prove()` call in handleDeliveryPacket doesn't
+        // blow up. In prod the Transport layer populates this before
+        // dispatching to the destination's callback.
+        setPacketField(packet, "destination", deliveryDest)
+
+        // Fire the real callback the router installed. This drives
+        // handleDeliveryPacket -> processInboundDelivery -> deliveryCallback.
+        val callback = deliveryDest.packetCallback
+        assertNotNull(callback)
+        callback.invoke(afterDestHash, packet)
+
+        assertEquals(1, received.size)
+        val delivered = received[0]
+        // Tight equality — loose membership would silently pass if the
+        // wrong packet were used or if a duplicate came through.
+        assertEquals(expectedRssi, delivered.receivedRssi)
+        assertEquals(expectedSnr, delivered.receivedSnr)
+        assertEquals(expectedHops, delivered.receivedHopCount)
+        assertNotNull(delivered.receivingInterfaceHash)
+        assertTrue(
+            expectedIfaceHash.contentEquals(delivered.receivingInterfaceHash!!),
+            "Interface hash on delivered LXMessage should equal the packet's receivingInterfaceHash"
+        )
+        assertEquals(DeliveryMethod.OPPORTUNISTIC, delivered.method)
+    }
+
+    @Test
+    fun `propagation-fetched message has null receive-time metadata`() {
+        // Invariant from issue #9: messages pulled from a propagation node
+        // have lost their original in-path packet context. Annotating them
+        // with the sync link's RSSI/SNR would mislead downstream consumers
+        // into thinking the values refer to the original sender. So the
+        // four metadata fields MUST be null for PROPAGATED.
+        //
+        // We can't drive this via a real propagation-node handshake in a
+        // pure unit test, so we reflectively invoke processInboundDelivery
+        // with method=PROPAGATED on a properly-encrypted blob. The code
+        // path under test — the null-on-propagated branch in the
+        // annotation block — is exercised exactly as in prod.
+        val received = CopyOnWriteArrayList<LXMessage>()
+        router.registerDeliveryCallback { received.add(it) }
+
+        // Set up a delivery destination whose identity we control so we
+        // can also build an OUT-direction destination that encrypts for it.
+        val destinationIdentity = Identity.create()
+        val inboundDest = router.registerDeliveryIdentity(destinationIdentity, "PropMetaNode")
+
+        // Build a valid inner LXMF wire-format blob. Source identity has
+        // to be remembered so signature validates.
+        val sourceIdentity = Identity.create()
+        val sourceDestination = Destination.create(
+            identity = sourceIdentity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        Identity.remember(
+            packetHash = ByteArray(32) { (it + 1).toByte() },
+            destHash = sourceDestination.hash,
+            publicKey = sourceIdentity.getPublicKey()
+        )
+
+        // Out-direction destination (shares the receiver's pub key) so we
+        // can encrypt the propagated blob.
+        val outboundToRecipient = Destination.create(
+            identity = destinationIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val innerMessage = LXMessage.create(
+            destination = outboundToRecipient,
+            source = sourceDestination,
+            content = "propagated payload",
+            title = "PropTest"
+        )
+        val innerPacked = innerMessage.pack()
+        val innerSansDestHash = innerPacked.copyOfRange(LXMFConstants.DESTINATION_LENGTH, innerPacked.size)
+
+        // Propagated wire format: [destHash(16)] + encrypted(sourceHash + sig + payload)
+        val encrypted = outboundToRecipient.encrypt(innerSansDestHash)
+        val propagatedBlob = inboundDest.hash + encrypted
+
+        val processInbound = LXMRouter::class.java.getDeclaredMethod(
+            "processInboundDelivery",
+            ByteArray::class.java,
+            DeliveryMethod::class.java,
+            Destination::class.java,
+            network.reticulum.link.Link::class.java,
+            Packet::class.java
+        )
+        processInbound.isAccessible = true
+        processInbound.invoke(router, propagatedBlob, DeliveryMethod.PROPAGATED, null, null, null)
+
+        assertEquals(1, received.size, "router should still deliver the propagated message")
+        val delivered = received[0]
+        assertEquals("propagated payload", delivered.content)
+        assertEquals(DeliveryMethod.PROPAGATED, delivered.method)
+        // The key invariant under test: no misleading phy metadata on a
+        // propagation-fetched message.
+        assertNull(delivered.receivedRssi, "PROPAGATED must leave receivedRssi null")
+        assertNull(delivered.receivedSnr, "PROPAGATED must leave receivedSnr null")
+        assertNull(delivered.receivingInterfaceHash, "PROPAGATED must leave receivingInterfaceHash null")
+        assertNull(delivered.receivedHopCount, "PROPAGATED must leave receivedHopCount null")
+    }
+
+    @Test
+    fun `opportunistic delivery with null packet phy stats leaves metadata null`() {
+        // Companion case to the happy path: a packet that carried no phy
+        // stats (interface didn't populate rssi/snr) should end up with
+        // NULL metadata on the LXMessage — not garbage / zeros. This pins
+        // the "null-or-meaningful" invariant downstream consumers rely on.
+        val received = CopyOnWriteArrayList<LXMessage>()
+        router.registerDeliveryCallback { received.add(it) }
+
+        val destinationIdentity = Identity.create()
+        val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "MetaNodeNull")
+        val packedMessage = packMessageTo(destinationIdentity, "payload no phy")
+        val afterDestHash = packedMessage.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedMessage.size)
+
+        val packet = Packet.createRaw(
+            destinationHash = deliveryDest.hash,
+            data = afterDestHash
+        )
+        packet.hops = 2
+        // Intentionally leave rssi/snr/receivingInterfaceHash unset (null).
+        // Associate the packet with the destination so the router's
+        // packet.prove() call succeeds as it does in prod.
+        setPacketField(packet, "destination", deliveryDest)
+
+        val callback = deliveryDest.packetCallback
+        assertNotNull(callback)
+        callback.invoke(afterDestHash, packet)
+
+        assertEquals(1, received.size)
+        val delivered = received[0]
+        assertNull(delivered.receivedRssi, "rssi should stay null when interface didn't provide it")
+        assertNull(delivered.receivedSnr, "snr should stay null when interface didn't provide it")
+        assertNull(delivered.receivingInterfaceHash, "interface hash should stay null when not set")
+        // hops is a non-nullable Int on Packet (defaults to 0 / user-set 2
+        // here), so it WILL propagate — that's correct.
+        assertEquals(2, delivered.receivedHopCount)
     }
 
     // Make propagationTransferState accessible for tests
