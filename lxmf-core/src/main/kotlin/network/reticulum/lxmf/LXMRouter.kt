@@ -886,8 +886,8 @@ class LXMRouter(
         // Packet callback for receiving messages
         link.setPacketCallback { data, packet ->
             // Send proof back to sender for delivery confirmation
-            packet?.prove()
-            processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
+            packet.prove()
+            processInboundDelivery(data, DeliveryMethod.DIRECT, null, link, sourcePacket = packet)
         }
 
         // Enable app-controlled resource acceptance for LXMF messages
@@ -1236,8 +1236,9 @@ class LXMRouter(
         val lxmfData = destination.hash + data
         println("[LXMRouter] Prepended dest hash, lxmfData size: ${lxmfData.size} bytes (was ${data.size})")
 
-        // Process the delivery
-        processInboundDelivery(lxmfData, method, destination)
+        // Process the delivery. `packet` carries the receive-time phy metadata
+        // (rssi/snr/interface/hops) we want to surface on the LXMessage.
+        processInboundDelivery(lxmfData, method, destination, sourcePacket = packet)
     }
 
     /**
@@ -1250,8 +1251,8 @@ class LXMRouter(
         // Set up link callbacks for packets
         link.setPacketCallback { data, packet ->
             // Send proof back to sender for delivery confirmation
-            packet?.prove()
-            processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link)
+            packet.prove()
+            processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link, sourcePacket = packet)
         }
 
         // Enable app-controlled resource acceptance for LXMF messages
@@ -1307,12 +1308,18 @@ class LXMRouter(
      * @param method The delivery method used
      * @param destination The destination that received the message
      * @param link Optional link if this came via direct delivery
+     * @param sourcePacket Optional delivering packet. Provided for single-packet
+     *   paths (OPPORTUNISTIC and single-packet DIRECT). Not available for
+     *   Resource-delivered or propagation-fetched messages. Used to annotate
+     *   the resulting LXMessage with receive-time phy metadata (rssi, snr,
+     *   interface hash, hop count).
      */
     private fun processInboundDelivery(
         data: ByteArray,
         method: DeliveryMethod,
         destination: Destination? = null,
         link: Link? = null,
+        sourcePacket: Packet? = null,
     ) {
         println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
 
@@ -1443,6 +1450,46 @@ class LXMRouter(
             transientId?.let {
                 locallyDeliveredTransientIds[it] = nowSeconds
                 saveTransientIdsAsync()
+            }
+
+            // Annotate the message with receive-time phy metadata from the
+            // delivering packet / link. Propagation-fetched messages are
+            // intentionally left null because the original in-path packet
+            // context is lost; the sync link's values would refer to the
+            // propagation node, not the original sender, and would be
+            // misleading. (See LXMessage.receivedRssi KDoc.)
+            //
+            // `receivingInterfaceHash` is defensively copied on assignment
+            // so that neither a caller mutating the delivered field nor the
+            // RNS layer recycling a buffer can leak across the boundary.
+            if (method != DeliveryMethod.PROPAGATED) {
+                if (sourcePacket != null) {
+                    // Single-packet path (OPPORTUNISTIC or small DIRECT): the
+                    // delivering packet carries authoritative phy metadata.
+                    message.receivedRssi = sourcePacket.rssi
+                    message.receivedSnr = sourcePacket.snr
+                    message.receivingInterfaceHash = sourcePacket.receivingInterfaceHash?.copyOf()
+                    message.receivedHopCount = sourcePacket.hops
+                } else if (link != null) {
+                    // Resource-delivered path: no single source packet is
+                    // available, but the Link aggregates phy stats from its
+                    // constituent packets (updatePhyStats fires on each
+                    // inbound packet on the link). The values reflect the
+                    // most recent packet on the link, which for a Resource
+                    // concluding at this moment is the final constituent
+                    // packet — exactly what we want. Note: getRssi/getSnr
+                    // return null unless trackPhyStats(true) has been
+                    // enabled on the link by the caller.
+                    message.receivedRssi = link.getRssi()
+                    message.receivedSnr = link.getSnr()
+                    message.receivingInterfaceHash = link.attachedInterfaceHash?.copyOf()
+                    // Every constituent packet of a Resource traverses the
+                    // same hop path as the link itself, so expectedHops is
+                    // the correct hop count for the delivered message.
+                    message.receivedHopCount = link.expectedHops
+                }
+                // else: no packet and no link — can happen if a caller
+                // threads data in via a non-standard path; leave fields null.
             }
 
             // Invoke delivery callback

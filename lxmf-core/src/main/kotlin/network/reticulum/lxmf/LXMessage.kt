@@ -157,6 +157,58 @@ class LXMessage private constructor(
     /** Next delivery attempt timestamp (milliseconds) */
     var nextDeliveryAttempt: Long? = null
 
+    // ===== Receive-time Packet Metadata =====
+    //
+    // The following fields are populated from the delivering Reticulum packet
+    // when this LXMessage is constructed on the receive side. They are only
+    // meaningful for live, in-path delivery (OPPORTUNISTIC and DIRECT);
+    // outgoing messages do not carry them, and messages pulled from a
+    // propagation node are intentionally left null because the original
+    // in-path packet context is lost (the values would reflect the
+    // propagation-node sync link, not the originating sender — which would
+    // be misleading).
+
+    /**
+     * RSSI of the delivering packet (signed integer, typically dBm).
+     *
+     * Null for outgoing messages and for messages fetched from a propagation
+     * node. For Resource-delivered (multi-packet) messages, this reflects the
+     * phy stats of the link at the moment the Resource assembly concluded
+     * (i.e. the final constituent packet). Requires the underlying Link to
+     * have `trackPhyStats(true)` enabled for Resource-delivered messages; for
+     * single-packet paths the value is copied from the delivering `Packet`
+     * directly and is available unconditionally.
+     */
+    var receivedRssi: Int? = null
+
+    /**
+     * SNR of the delivering packet.
+     *
+     * Null for outgoing messages and for messages fetched from a propagation
+     * node. See [receivedRssi] for semantics on Resource-delivered messages.
+     */
+    var receivedSnr: Float? = null
+
+    /**
+     * Hash of the interface the delivering packet arrived on.
+     *
+     * Null for outgoing messages and for messages fetched from a propagation
+     * node. For Resource-delivered messages, reflects the interface the link
+     * was attached to.
+     */
+    var receivingInterfaceHash: ByteArray? = null
+
+    /**
+     * Number of hops the delivering packet traveled to reach us.
+     *
+     * Null for outgoing messages and for messages fetched from a propagation
+     * node. For Resource-delivered messages, reflects the link's expected
+     * hop count (established at link-setup time), which is the correct hop
+     * count for the Resource because every Resource constituent packet
+     * travels the same hop path as the link itself.
+     */
+    var receivedHopCount: Int? = null
+
     /**
      * Pack the message into wire format.
      *
