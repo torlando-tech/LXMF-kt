@@ -872,22 +872,32 @@ class LXMRouterTest {
             )
         }
 
-        // 1. Queue one message that will be picked up by processOutbound.
-        val firstMessage = buildOutboundMessage(destIdentity1)
-        firstMessage.nextDeliveryAttempt = 0L // ready for dispatch now
-        router.handleOutbound(firstMessage)
-        assertEquals(1, router.pendingOutboundCount())
-
-        // 2. Install the test hook so processOutboundMessage suspends
-        // indefinitely (until we release it). Pre-fix this suspension
-        // happens INSIDE pendingOutboundMutex.withLock, so any concurrent
-        // handleOutbound call is wedged on the same mutex.
+        // 1. Install the test hook FIRST, before any message is queued.
+        // processOutboundMessage suspends indefinitely inside the hook
+        // until we release it. Pre-fix this suspension happens INSIDE
+        // pendingOutboundMutex.withLock, so any concurrent handleOutbound
+        // call is wedged on the same mutex.
+        //
+        // Install-before-queue ordering matters: handleOutbound calls
+        // triggerProcessing(), which would launch processOutbound on
+        // processingScope's Dispatchers.IO if router.start() had been
+        // called. Today start() is not called in this test so
+        // triggerProcessing is a no-op, but installing the hook first
+        // makes the test robust to future changes (e.g. if start() is
+        // added to @BeforeEach) and eliminates any reader's doubt about
+        // a scope-launch-vs-hook-install race.
         val hookEntered = CompletableDeferred<Unit>()
         val hookRelease = CompletableDeferred<Unit>()
         router.testHookOnProcessOutboundMessage = {
             hookEntered.complete(Unit)
             hookRelease.await()
         }
+
+        // 2. Queue one message that will be picked up by processOutbound.
+        val firstMessage = buildOutboundMessage(destIdentity1)
+        firstMessage.nextDeliveryAttempt = 0L // ready for dispatch now
+        router.handleOutbound(firstMessage)
+        assertEquals(1, router.pendingOutboundCount())
 
         // 3. Launch processOutbound in a separate coroutine. It will
         // call processOutboundMessage (hitting our hook) and suspend.
