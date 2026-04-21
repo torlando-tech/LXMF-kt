@@ -97,6 +97,15 @@ class LXMRouter(
     }
 
     // ===== Message Queues =====
+    //
+    // Lock ordering (to avoid deadlock on any future nested acquisition):
+    //   pendingOutboundMutex  →  failedOutboundMutex
+    //
+    // Today the only nested site is inside [processOutbound] where a
+    // FAILED-state message is moved from pendingOutbound to failedOutbound.
+    // The reverse order is never acquired. Any new code that needs both
+    // mutexes MUST follow this order, or restructure to take them
+    // independently.
 
     /** Pending inbound messages awaiting processing */
     private val pendingInbound = mutableListOf<LXMessage>()
@@ -578,6 +587,18 @@ class LXMRouter(
             // queue mutex across these calls — as this method used to — would
             // wedge every handleOutbound caller behind whatever interface
             // blocks longest.
+            //
+            // Intra-batch ordering is intentionally sequential: messages
+            // snapshotted into toDispatch in one processOutbound() call are
+            // dispatched in FIFO order, one after the other, under the
+            // outboundProcessingMutex guard. This means a slow send for the
+            // first message still delays the second message in the same
+            // batch — but this no longer blocks unrelated handleOutbound
+            // callers (which was the bug this PR fixes). Parallelising
+            // intra-batch dispatch (e.g. launching per-message coroutines)
+            // is a possible future optimisation; it is deliberately not done
+            // here to keep the fix minimal and preserve the existing
+            // delivery-ordering contract.
             for (message in toDispatch) {
                 processOutboundMessage(message)
             }
