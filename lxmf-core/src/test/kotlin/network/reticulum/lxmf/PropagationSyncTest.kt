@@ -80,7 +80,7 @@ class PropagationSyncTest {
             "Sync should not fail when node is in map and hash is set",
         )
 
-        router.stop()
+        router.close()
     }
 
     @Test
@@ -117,6 +117,6 @@ class PropagationSyncTest {
             "Should fail when no active node hash is set",
         )
 
-        router.stop()
+        router.close()
     }
 }
