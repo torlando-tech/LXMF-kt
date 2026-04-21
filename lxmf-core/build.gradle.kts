@@ -59,7 +59,7 @@ dependencies {
 tasks.named<Test>("test") {
     if (project.findProperty("runInteropTests") != "true") {
         filter {
-            excludeTestsMatching("network.reticulum.lxmf.interop.*")
+            excludeTestsMatching("network.reticulum.lxmf.interop.**")
         }
     }
 }
