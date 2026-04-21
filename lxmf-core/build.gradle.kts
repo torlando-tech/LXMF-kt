@@ -49,3 +49,17 @@ dependencies {
     // Compression - Apache Commons Compress for BZ2 interop tests
     testImplementation("org.apache.commons:commons-compress:1.26.0")
 }
+
+// Exclude the `interop` test suite from the default `test` task. These tests
+// spawn a Python bridge subprocess from `python-bridge/bridge_server.py`
+// (provided out-of-band via the rns-test dependency's setup scripts) and fail
+// in any environment where that bridge isn't available — including default
+// GitHub Actions runners. Opt in with `-PrunInteropTests=true` locally when
+// the Python-side setup is prepared.
+tasks.named<Test>("test") {
+    if (project.findProperty("runInteropTests") != "true") {
+        filter {
+            excludeTestsMatching("network.reticulum.lxmf.interop.**")
+        }
+    }
+}
