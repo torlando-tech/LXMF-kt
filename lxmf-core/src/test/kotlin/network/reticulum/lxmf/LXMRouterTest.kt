@@ -1,6 +1,10 @@
 package network.reticulum.lxmf
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
@@ -815,6 +819,114 @@ class LXMRouterTest {
         // hops is a non-nullable Int on Packet (defaults to 0 / user-set 2
         // here), so it WILL propagate — that's correct.
         assertEquals(2, delivered.receivedHopCount)
+    }
+
+    /**
+     * Regression test for the send-spinner-hang observed on 2026-04-20.
+     *
+     * Symptom: two Columba phones messaging each other; after disabling
+     * interfaces on one phone mid-send, subsequent sends hang forever with
+     * the UI spinner never clearing. On-device instrumentation narrowed
+     * the wedge to [LXMRouter.handleOutbound] blocking at
+     * `pendingOutboundMutex.withLock`, waiting on a lock held by a prior
+     * [processOutbound] call that was stuck inside [processOutboundMessage]
+     * (synchronous `packet.send()` blocking on a flaky/disabled interface).
+     *
+     * Root cause: [processOutbound] held [pendingOutboundMutex] across
+     * every per-message delivery dispatch. A single hung delivery wedged
+     * every subsequent [handleOutbound] caller on the same mutex.
+     *
+     * Invariant this test pins: `handleOutbound` must not block on a
+     * long-running [processOutboundMessage] call. Concretely, the lock
+     * must be released BEFORE the per-message dispatch runs.
+     *
+     * Pre-fix behaviour: the `withTimeout(400)` below trips because
+     * `handleOutbound` suspends on the mutex held by the wedged hook.
+     * Post-fix behaviour: `handleOutbound` completes within a few ms.
+     */
+    @Test
+    fun `handleOutbound not blocked when processOutboundMessage hangs (regression)`() = runBlocking {
+        val destIdentity1 = Identity.create()
+        val destIdentity2 = Identity.create()
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        fun buildOutboundMessage(destIdentity: Identity): LXMessage {
+            val destDestination = Destination.create(
+                identity = destIdentity,
+                direction = DestinationDirection.OUT,
+                type = DestinationType.SINGLE,
+                appName = "lxmf",
+                "delivery"
+            )
+            return LXMessage.create(
+                destination = destDestination,
+                source = sourceDestination,
+                content = "test",
+                title = "test"
+            )
+        }
+
+        // 1. Install the test hook FIRST, before any message is queued.
+        // processOutboundMessage suspends indefinitely inside the hook
+        // until we release it. Pre-fix this suspension happens INSIDE
+        // pendingOutboundMutex.withLock, so any concurrent handleOutbound
+        // call is wedged on the same mutex.
+        //
+        // Install-before-queue ordering matters: handleOutbound calls
+        // triggerProcessing(), which would launch processOutbound on
+        // processingScope's Dispatchers.IO if router.start() had been
+        // called. Today start() is not called in this test so
+        // triggerProcessing is a no-op, but installing the hook first
+        // makes the test robust to future changes (e.g. if start() is
+        // added to @BeforeEach) and eliminates any reader's doubt about
+        // a scope-launch-vs-hook-install race.
+        val hookEntered = CompletableDeferred<Unit>()
+        val hookRelease = CompletableDeferred<Unit>()
+        router.testHookOnProcessOutboundMessage = {
+            hookEntered.complete(Unit)
+            hookRelease.await()
+        }
+
+        // 2. Queue one message that will be picked up by processOutbound.
+        val firstMessage = buildOutboundMessage(destIdentity1)
+        firstMessage.nextDeliveryAttempt = 0L // ready for dispatch now
+        router.handleOutbound(firstMessage)
+        assertEquals(1, router.pendingOutboundCount())
+
+        // 3. Launch processOutbound in a separate coroutine. It will
+        // call processOutboundMessage (hitting our hook) and suspend.
+        val processJob = launch(Dispatchers.Default) { router.processOutbound() }
+
+        try {
+            // 4. Wait until the hook has been entered — at this point,
+            // processOutbound is suspended inside processOutboundMessage.
+            // The question under test: is pendingOutboundMutex still held?
+            hookEntered.await()
+
+            // 5. Call handleOutbound from the test coroutine. If the
+            // mutex is held across the hook (bug), this suspends until
+            // the timeout trips. Post-fix, the mutex has already been
+            // released, so this returns in a few ms.
+            withTimeout(400) {
+                router.handleOutbound(buildOutboundMessage(destIdentity2))
+            }
+
+            assertEquals(
+                2,
+                router.pendingOutboundCount(),
+                "Second message should be queued while processOutbound is mid-dispatch"
+            )
+        } finally {
+            hookRelease.complete(Unit)
+            router.testHookOnProcessOutboundMessage = null
+            processJob.join()
+        }
     }
 
     // Make propagationTransferState accessible for tests

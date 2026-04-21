@@ -97,6 +97,15 @@ class LXMRouter(
     }
 
     // ===== Message Queues =====
+    //
+    // Lock ordering (to avoid deadlock on any future nested acquisition):
+    //   pendingOutboundMutex  →  failedOutboundMutex
+    //
+    // Today the only nested site is inside [processOutbound] where a
+    // FAILED-state message is moved from pendingOutbound to failedOutbound.
+    // The reverse order is never acquired. Any new code that needs both
+    // mutexes MUST follow this order, or restructure to take them
+    // independently.
 
     /** Pending inbound messages awaiting processing */
     private val pendingInbound = mutableListOf<LXMessage>()
@@ -517,8 +526,16 @@ class LXMRouter(
 
         try {
             val toRemove = mutableListOf<LXMessage>()
+            val toDispatch = mutableListOf<LXMessage>()
+            val toFailCallback = mutableListOf<LXMessage>()
             val currentTime = System.currentTimeMillis()
 
+            // Classify current pendingOutbound under the queue lock. Do NOT
+            // invoke user callbacks or per-message delivery dispatch here —
+            // those can suspend on network I/O (packet.send over a flaky
+            // interface) and would wedge every concurrent handleOutbound
+            // caller on this same mutex. See LXMRouterTest
+            // "handleOutbound not blocked when processOutboundMessage hangs".
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
                     when (message.state) {
@@ -535,7 +552,7 @@ class LXMRouter(
 
                         MessageState.CANCELLED, MessageState.REJECTED -> {
                             toRemove.add(message)
-                            failedDeliveryCallback?.invoke(message)
+                            toFailCallback.add(message)
                         }
 
                         MessageState.FAILED -> {
@@ -543,14 +560,15 @@ class LXMRouter(
                             failedOutboundMutex.withLock {
                                 failedOutbound.add(message)
                             }
-                            failedDeliveryCallback?.invoke(message)
+                            toFailCallback.add(message)
                         }
 
                         MessageState.OUTBOUND -> {
-                            // Check if ready to attempt delivery
+                            // Check if ready to attempt delivery. The actual
+                            // dispatch happens AFTER we release the lock.
                             val nextAttempt = message.nextDeliveryAttempt ?: 0L
                             if (currentTime >= nextAttempt) {
-                                processOutboundMessage(message)
+                                toDispatch.add(message)
                             }
                         }
 
@@ -563,15 +581,59 @@ class LXMRouter(
                 // Remove processed messages
                 pendingOutbound.removeAll(toRemove)
             }
+
+            // Dispatch per-message delivery OUTSIDE the queue lock. This is
+            // where the real work (and any blocking I/O) happens. Holding the
+            // queue mutex across these calls — as this method used to — would
+            // wedge every handleOutbound caller behind whatever interface
+            // blocks longest.
+            //
+            // Intra-batch ordering is intentionally sequential: messages
+            // snapshotted into toDispatch in one processOutbound() call are
+            // dispatched in FIFO order, one after the other, under the
+            // outboundProcessingMutex guard. This means a slow send for the
+            // first message still delays the second message in the same
+            // batch — but this no longer blocks unrelated handleOutbound
+            // callers (which was the bug this PR fixes). Parallelising
+            // intra-batch dispatch (e.g. launching per-message coroutines)
+            // is a possible future optimisation; it is deliberately not done
+            // here to keep the fix minimal and preserve the existing
+            // delivery-ordering contract.
+            for (message in toDispatch) {
+                processOutboundMessage(message)
+            }
+
+            // User callbacks for terminal-state messages also run outside
+            // the lock — same rationale. A slow or misbehaving callback
+            // shouldn't block unrelated sends from being queued.
+            val failedCb = failedDeliveryCallback
+            if (failedCb != null) {
+                for (message in toFailCallback) {
+                    failedCb.invoke(message)
+                }
+            }
         } finally {
             outboundProcessingMutex.unlock()
         }
     }
 
     /**
+     * Test-only hook fired at the start of [processOutboundMessage]. Exists
+     * so a regression test for "mutex held across per-message dispatch" can
+     * simulate a slow / hung delivery by suspending in this hook; any
+     * coroutine trying to take [pendingOutboundMutex] concurrently reveals
+     * whether the mutex is still held while the hook is in-flight. Production
+     * code MUST NOT install this.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal var testHookOnProcessOutboundMessage: (suspend (LXMessage) -> Unit)? = null
+
+    /**
      * Process a single outbound message based on its delivery method.
      */
     private suspend fun processOutboundMessage(message: LXMessage) {
+        testHookOnProcessOutboundMessage?.invoke(message)
+
         val method = message.desiredMethod ?: DeliveryMethod.DIRECT
 
         when (method) {
