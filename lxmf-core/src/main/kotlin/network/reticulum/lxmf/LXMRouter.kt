@@ -184,7 +184,29 @@ class LXMRouter(
     private var running = false
 
     /** Coroutine scope for background processing */
-    private var processingScope: CoroutineScope? = null
+    /**
+     * Process-lifetime scope for outbound dispatch + deferred-stamp + cache
+     * cleanup work. Previously this was `var processingScope: CoroutineScope?`
+     * assigned in [start] and cancelled+nulled in [stop]; [triggerProcessing]
+     * and a dozen other call sites used `processingScope.launch { ... }`,
+     * which silently no-op'd whenever the scope was null. That created a
+     * latent silent-drop hazard: any lifecycle transition that called [stop]
+     * without [start] being re-called left `handleOutbound` silently
+     * enqueueing messages that no coroutine would ever dispatch — messages
+     * "stuck pending" forever in downstream consumer UIs. Reproduced on a
+     * Columba device on 2026-04-21 after a Doze cycle.
+     *
+     * The scope is now owned by the router for its entire object lifetime
+     * and is never null. [start] / [stop] gate the PERIODIC processing
+     * loop (via the [running] flag and [processingJob]), not the scope
+     * itself; one-shot launches from [triggerProcessing] and its peers
+     * succeed whether or not [start] has been called. This matches the
+     * structural fix pattern from reticulum-kt PR #818
+     * (NativeInterfaceFactory) — give the class its own non-null val
+     * scope, never let a child-cancellable reference back at it.
+     */
+    private val processingScope: CoroutineScope =
+        CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     /** Processing job */
     private var processingJob: Job? = null
@@ -509,7 +531,7 @@ class LXMRouter(
      * Trigger outbound processing.
      */
     private fun triggerProcessing() {
-        processingScope?.launch {
+        processingScope.launch {
             processOutbound()
         }
     }
@@ -701,7 +723,7 @@ class LXMRouter(
                 // Drop existing path and re-request (Python does this via Reticulum.drop_path + request_path)
                 Transport.expirePath(dest.hash)
                 // Small delay then request new path (matching Python's 0.5s sleep in thread)
-                processingScope?.launch {
+                processingScope.launch {
                     delay(500)
                     Transport.requestPath(dest.hash)
                 }
@@ -993,7 +1015,7 @@ class LXMRouter(
      * Handle a link being closed.
      */
     private fun handleLinkClosed(destHashHex: String) {
-        processingScope?.launch {
+        processingScope.launch {
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
                     if (message.destinationHash.toHexString() == destHashHex &&
@@ -1630,7 +1652,7 @@ class LXMRouter(
 
         // Trigger retry for pending messages to this destination
         val destHashHex = destHash.toHexString()
-        processingScope?.launch {
+        processingScope.launch {
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
                     if (message.destinationHash.toHexString() == destHashHex) {
@@ -1654,10 +1676,11 @@ class LXMRouter(
         loadPropagationNodes()
 
         running = true
-        processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
+        // processingScope is now process-lifetime (constructed at router init);
+        // start() no longer assigns it. The periodic loop below is still gated
+        // by the `running` flag and tracked via processingJob for cancellation.
         processingJob =
-            processingScope?.launch {
+            processingScope.launch {
                 while (running) {
                     try {
                         processOutbound()
@@ -1683,9 +1706,13 @@ class LXMRouter(
      */
     fun stop() {
         running = false
+        // Cancel the periodic processing loop — but NOT the scope itself.
+        // Keeping processingScope alive across stop() means a subsequent
+        // handleOutbound() call will still dispatch via triggerProcessing,
+        // instead of silently enqueueing a message with no coroutine to
+        // ever run it. See the processingScope KDoc for the 2026-04-21
+        // silent-drop regression that motivated this change.
         processingJob?.cancel()
-        processingScope?.cancel()
-        processingScope = null
     }
 
     // ===== Utility Methods =====
@@ -2055,7 +2082,7 @@ class LXMRouter(
                             requestMessageList(establishedLink)
                         } else {
                             // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
-                            processingScope?.launch {
+                            processingScope.launch {
                                 // Reset nextDeliveryAttempt for pending PROPAGATED messages so they get processed immediately.
                                 // This matches Python's behavior where process_outbound sends immediately when link is active,
                                 // without checking next_delivery_attempt (which was set when we initiated link establishment).
@@ -2156,7 +2183,7 @@ class LXMRouter(
                 if (messageListRetryCount < MAX_MESSAGE_LIST_RETRIES) {
                     messageListRetryCount++
                     println("Propagation node returned error $errorCode, retrying ($messageListRetryCount/$MAX_MESSAGE_LIST_RETRIES)...")
-                    processingScope?.launch {
+                    processingScope.launch {
                         kotlinx.coroutines.delay(MESSAGE_LIST_RETRY_DELAY_MS * messageListRetryCount)
                         requestMessageList(link)
                     }
@@ -2523,7 +2550,7 @@ class LXMRouter(
     }
 
     private fun saveOutboundStampCostsAsync() {
-        processingScope?.launch {
+        processingScope.launch {
             costFileMutex.withLock { saveOutboundStampCosts() }
         }
     }
@@ -2628,7 +2655,7 @@ class LXMRouter(
     }
 
     private fun saveAvailableTicketsAsync() {
-        processingScope?.launch {
+        processingScope.launch {
             ticketFileMutex.withLock { saveAvailableTickets() }
         }
     }
@@ -2746,7 +2773,7 @@ class LXMRouter(
     }
 
     private fun saveTransientIdsAsync() {
-        processingScope?.launch {
+        processingScope.launch {
             transientIdFileMutex.withLock { saveTransientIds() }
         }
     }

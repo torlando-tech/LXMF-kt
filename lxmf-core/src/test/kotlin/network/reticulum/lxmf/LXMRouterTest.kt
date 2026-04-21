@@ -929,6 +929,86 @@ class LXMRouterTest {
         }
     }
 
+    /**
+     * Regression test for the post-Doze messaging-wedge observed on
+     * 2026-04-21 on Columba phones. After a Doze cycle (`dumpsys
+     * deviceidle force-idle` + `unforce`), the LXMF router ended up with
+     * `processingScope == null`: messages queued via `handleOutbound`
+     * were never dispatched, UI showed "pending" forever.
+     *
+     * Root cause: `triggerProcessing()` is `processingScope?.launch { ... }`.
+     * If the scope is null (router never started, or stopped and not
+     * re-started), the launch is a silent no-op — messages accumulate
+     * in `pendingOutbound` with no dispatcher to run `processOutbound`.
+     * Classic silent-drop anti-pattern #1 from
+     * [memory/feedback-silent-drop-patterns.md].
+     *
+     * Invariant this test pins: once `start()` has been called — even
+     * if `stop()` is subsequently called (simulating the lifecycle gap
+     * after Android's low-memory killer or a Doze-related process
+     * teardown) — any subsequent `handleOutbound` call MUST either
+     * dispatch the message, surface an error loudly, or transition the
+     * message out of `OUTBOUND` state within a bounded time. Pre-fix:
+     * the test times out because nothing runs. Post-fix: the test
+     * passes because the process-lifetime scope dispatches even after
+     * stop().
+     */
+    @Test
+    fun `handleOutbound dispatches after start-then-stop (regression - processingScope silent drop)`() = runBlocking {
+        // Simulate the post-Doze lifecycle gap: router was started, then
+        // stopped — matching a Columba scenario where the reticulum
+        // subprocess lifecycle or Android process management takes the
+        // router down without a clean re-start.
+        router.start()
+        router.stop()
+
+        // Arrange: a one-shot probe that completes when processOutboundMessage
+        // is actually invoked on a message. If triggerProcessing silently
+        // drops, this deferred never completes and the test times out.
+        val dispatched = CompletableDeferred<Unit>()
+        router.testHookOnProcessOutboundMessage = { dispatched.complete(Unit) }
+
+        val destIdentity = Identity.create()
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "post-stop",
+            title = "post-stop",
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC
+        )
+
+        try {
+            router.handleOutbound(message)
+            assertEquals(
+                1,
+                router.pendingOutboundCount(),
+                "Message should be queued in pendingOutbound after handleOutbound"
+            )
+
+            // Pre-fix: triggerProcessing silently drops; no dispatch; timeout.
+            // Post-fix: process-lifetime scope keeps dispatching; hook fires in ms.
+            withTimeout(1000) {
+                dispatched.await()
+            }
+        } finally {
+            router.testHookOnProcessOutboundMessage = null
+        }
+    }
+
     // Make propagationTransferState accessible for tests
     val LXMRouter.propagationTransferState: LXMRouter.PropagationTransferState
         get() = try {
