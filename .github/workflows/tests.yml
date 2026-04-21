@@ -1,0 +1,46 @@
+name: Tests
+
+# Runs the lxmf-core unit tests on every PR so regressions land-gated
+# instead of relying on author-local validation. The interop subpackage
+# (`network.reticulum.lxmf.interop.*`) is excluded by default — those
+# tests spawn a Python bridge subprocess that isn't available in the
+# default runner environment. Opt in with `-PrunInteropTests=true` from
+# a workflow that has prepared the bridge.
+#
+# Motivated by LXMF-kt#11 which added a concurrency regression test;
+# without CI, that test is just checked-in documentation of an
+# invariant rather than an enforced guarantee.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run lxmf-core unit tests (excluding interop)
+        run: ./gradlew :lxmf-core:test --no-daemon
+
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: lxmf-core/build/reports/tests/test/
+          retention-days: 14
