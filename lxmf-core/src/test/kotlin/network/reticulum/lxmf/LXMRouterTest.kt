@@ -35,7 +35,10 @@ class LXMRouterTest {
 
     @AfterEach
     fun teardown() {
-        router.stop()
+        // close() cancels processingScope in addition to stop(), so each
+        // per-test router releases its SupervisorJob instead of leaking one
+        // scope per test until GC.
+        router.close()
     }
 
     @Test
