@@ -42,7 +42,7 @@ class LXMRouter(
     private val storagePath: String? = null,
     /** Whether to automatically peer with propagation nodes */
     private val autopeer: Boolean = true,
-) {
+) : AutoCloseable {
     // ===== Configuration Constants =====
 
     companion object {
@@ -183,7 +183,6 @@ class LXMRouter(
     @Volatile
     private var running = false
 
-    /** Coroutine scope for background processing */
     /**
      * Process-lifetime scope for outbound dispatch + deferred-stamp + cache
      * cleanup work. Previously this was `var processingScope: CoroutineScope?`
@@ -204,6 +203,11 @@ class LXMRouter(
      * structural fix pattern from reticulum-kt PR #818
      * (NativeInterfaceFactory) — give the class its own non-null val
      * scope, never let a child-cancellable reference back at it.
+     *
+     * For non-singleton use (e.g. tests that create many routers, or a
+     * rebuild after a reticulum-subprocess restart), call [close] to
+     * release the scope — otherwise its [SupervisorJob] anchors any
+     * in-flight coroutines until the process exits.
      */
     private val processingScope: CoroutineScope =
         CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -1713,6 +1717,22 @@ class LXMRouter(
         // ever run it. See the processingScope KDoc for the 2026-04-21
         // silent-drop regression that motivated this change.
         processingJob?.cancel()
+    }
+
+    /**
+     * Release the router's [processingScope] and the periodic processing
+     * loop. Intended for non-singleton use — tests that create many routers,
+     * or any caller that rebuilds the router after a reticulum-subprocess
+     * restart. After [close] the router must not be reused; any call to
+     * [handleOutbound] or [triggerProcessing] will no-op silently because
+     * the scope's [SupervisorJob] has been cancelled.
+     *
+     * For singleton Android use the default [stop] is sufficient; calling
+     * [close] is optional.
+     */
+    override fun close() {
+        stop()
+        processingScope.cancel()
     }
 
     // ===== Utility Methods =====
