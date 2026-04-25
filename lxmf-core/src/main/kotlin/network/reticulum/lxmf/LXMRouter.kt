@@ -1545,13 +1545,43 @@ class LXMRouter(
                 }
             }
 
-            // Mark as delivered. See dedupKey computation above for why
-            // we key on message.hash rather than transientId.
+            // Mark as delivered. Both keys (message.hash and, for
+            // PROPAGATED/PAPER, the wire-source transient_id) are written
+            // BEFORE the single saveTransientIdsAsync() call below — that
+            // way the launched save coroutine reads a complete map at
+            // execution time and a single file rewrite captures both
+            // entries (vs two saves where the first could race ahead of
+            // the second write). See dedupKey computation above for the
+            // message.hash rationale, and #15 for the wire-source key
+            // rationale (mirrors Python LXMRouter.py:1792 + 2320 — both
+            // keys coexist in the heterogeneous-key dedup map).
+            //
+            //   PROPAGATED: the propagation node sends a list of
+            //     transient_ids in its message-list response; the
+            //     wantedIds filter at LXMRouter.kt:2231 queries by that
+            //     transient_id. The propagation transient_id is
+            //     full_hash(dest_hash + encrypted_payload) — i.e.
+            //     full_hash(`data`) BEFORE we decrypt it locally.
+            //
+            //   PAPER: the paper-message ingestion path computes
+            //     transient_id = full_hash(lxmfData) at LXMRouter.kt:3023
+            //     before invoking processInboundDelivery; writing
+            //     full_hash(`data`) makes that outer dedup actually fire
+            //     on the second ingestion of the same paper message
+            //     instead of always missing and falling through to the
+            //     inner message.hash dedup.
             val nowSeconds = System.currentTimeMillis() / 1000
+            var anyKeyWritten = false
             dedupKey?.let {
                 locallyDeliveredTransientIds[it] = nowSeconds
-                saveTransientIdsAsync()
+                anyKeyWritten = true
             }
+            if (method == DeliveryMethod.PROPAGATED || method == DeliveryMethod.PAPER) {
+                val wireTransientIdHex = Hashes.fullHash(data).toHexString()
+                locallyDeliveredTransientIds[wireTransientIdHex] = nowSeconds
+                anyKeyWritten = true
+            }
+            if (anyKeyWritten) saveTransientIdsAsync()
 
             // Annotate the message with receive-time phy metadata from the
             // delivering packet / link. Propagation-fetched messages are
