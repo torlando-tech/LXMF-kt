@@ -1553,6 +1553,33 @@ class LXMRouter(
                 saveTransientIdsAsync()
             }
 
+            // Heterogeneous-key dedup: for delivery methods whose receive
+            // path queries the dedup map by WIRE-SOURCE transient_id (not
+            // message.hash), also write the wire-source key. Mirrors Python
+            // LXMRouter.py:2320 which writes transient_id alongside the
+            // message.hash from line 1792, so has_message(...) works for
+            // either key shape. See #15 for the full callsite analysis.
+            //
+            //   PROPAGATED: the propagation node sends a list of
+            //     transient_ids in its message-list response; the
+            //     wantedIds filter at LXMRouter.kt:2231 queries by that
+            //     transient_id. The propagation transient_id is
+            //     full_hash(dest_hash + encrypted_payload) — i.e.
+            //     full_hash(`data`) BEFORE we decrypt it locally.
+            //
+            //   PAPER: the paper-message ingestion path computes
+            //     transient_id = full_hash(lxmfData) at LXMRouter.kt:3023
+            //     before invoking processInboundDelivery; writing
+            //     full_hash(`data`) makes that outer dedup actually fire
+            //     on the second ingestion of the same paper message
+            //     instead of always missing and falling through to the
+            //     inner message.hash dedup.
+            if (method == DeliveryMethod.PROPAGATED || method == DeliveryMethod.PAPER) {
+                val wireTransientIdHex = Hashes.fullHash(data).toHexString()
+                locallyDeliveredTransientIds[wireTransientIdHex] = nowSeconds
+                saveTransientIdsAsync()
+            }
+
             // Annotate the message with receive-time phy metadata from the
             // delivering packet / link. Propagation-fetched messages are
             // intentionally left null because the original in-path packet
