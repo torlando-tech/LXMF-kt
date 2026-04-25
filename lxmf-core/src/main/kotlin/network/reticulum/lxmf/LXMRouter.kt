@@ -1458,9 +1458,21 @@ class LXMRouter(
             message.incoming = true
             message.method = method
 
-            // Check for duplicates
-            val transientId = message.transientId?.toHexString()
-            if (transientId != null && locallyDeliveredTransientIds.containsKey(transientId)) {
+            // Check for duplicates. Dedup on message.hash (full hash of
+            // destination_hash + source_hash + payload-without-stamp), which
+            // is set unconditionally by LXMessage.unpackFromBytes:763. The
+            // older code checked transientId, but transientId is only
+            // populated on the SENDER side during outbound packing for
+            // propagation (LXMessage.kt outbound → LXMessage.py:439); on the
+            // incoming path it's always null, so the dedup check was a
+            // perpetual no-op. This let DIRECT-delivery LXMessages large
+            // enough to trigger Resource transfer (>319 bytes) deliver
+            // twice — once via setPacketCallback firing on the final chunk,
+            // once via setResourceConcludedCallback firing on assembly. See
+            // LXMF-kt#8. Matches Python LXMRouter.py:1788/1792 which uses
+            // message.hash as the locally_delivered_transient_ids key.
+            val dedupKey = message.hash?.toHexString()
+            if (dedupKey != null && locallyDeliveredTransientIds.containsKey(dedupKey)) {
                 println("Duplicate message detected, ignoring")
                 return
             }
@@ -1533,9 +1545,10 @@ class LXMRouter(
                 }
             }
 
-            // Mark as delivered
+            // Mark as delivered. See dedupKey computation above for why
+            // we key on message.hash rather than transientId.
             val nowSeconds = System.currentTimeMillis() / 1000
-            transientId?.let {
+            dedupKey?.let {
                 locallyDeliveredTransientIds[it] = nowSeconds
                 saveTransientIdsAsync()
             }
