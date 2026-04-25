@@ -87,14 +87,14 @@ abstract class OpportunisticDeliveryTestBase : DirectDeliveryTestBase() {
         println("  [Setup] Waiting for TCP connection to establish...")
         val connectionDeadline = System.currentTimeMillis() + 10000 // 10 second timeout
         while (System.currentTimeMillis() < connectionDeadline) {
-            if (kotlinTcpClient!!.online.get()) {
+            if (kotlinTcpClient!!.online.value) {
                 println("  [Setup] TCP connection established successfully")
                 break
             }
             Thread.sleep(100)
         }
 
-        if (!kotlinTcpClient!!.online.get()) {
+        if (!kotlinTcpClient!!.online.value) {
             println("  [Setup] WARNING: TCP connection not established within timeout")
         }
 
@@ -116,7 +116,7 @@ abstract class OpportunisticDeliveryTestBase : DirectDeliveryTestBase() {
 
         // Wait for network to stabilize (without announce)
         Thread.sleep(2000)
-        println("  [Setup] Final connection status: online=${kotlinTcpClient!!.online.get()}")
+        println("  [Setup] Final connection status: online=${kotlinTcpClient!!.online.value}")
     }
 
     /**

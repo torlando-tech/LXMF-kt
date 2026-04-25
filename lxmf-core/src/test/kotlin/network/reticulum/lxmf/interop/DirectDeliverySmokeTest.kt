@@ -31,7 +31,7 @@ class DirectDeliverySmokeTest : DirectDeliveryTestBase() {
     fun `TCP connection is active`() {
         // TCP client should be connected
         kotlinTcpClient shouldNotBe null
-        kotlinTcpClient!!.online.get() shouldBe true
+        kotlinTcpClient!!.online.value shouldBe true
     }
 
     @Test
