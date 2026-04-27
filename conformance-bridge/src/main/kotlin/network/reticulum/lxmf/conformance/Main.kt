@@ -115,6 +115,89 @@ private fun ensureRouter(name: String): LXMRouter =
         ?: throw IllegalStateException("lxmf_init must be called before $name")
 
 // ----------------------------------------------------------------------
+// LXMF field codec
+// ----------------------------------------------------------------------
+//
+// LXMF `fields` is a `Map<Int, Any>` whose leaf values can be ByteArray,
+// String, Int/Long, Boolean, or nested Lists/Maps; the wire format is
+// msgpack and ByteArray vs String are *distinct* msgpack types. JSON-RPC
+// can't carry bytes natively so the bridge contract uses tagged objects:
+//   - {"bytes": "<hex>"}
+//   - {"str": "..."}
+//   - {"int": 123}
+//   - {"bool": true}
+//   - JSON arrays for lists
+//   - bare JSON primitives pass through
+//
+// The explicit "bytes" tag is load-bearing for FIELD_FILE_ATTACHMENTS
+// (id 0x05): each attachment is `[filename_str, data_bytes]` and without
+// the tag we'd lose the bytes-vs-string distinction round-tripping
+// through JSON. Mirrors reference/lxmf_python.py exactly.
+
+private fun decodeFieldValue(value: Any?): Any? {
+    if (value == null || value == JSONObject.NULL) return null
+    return when (value) {
+        is JSONObject -> when {
+            value.has("bytes") -> hexToBytes(value.getString("bytes"))
+            value.has("str") -> value.getString("str")
+            value.has("int") -> value.getLong("int")
+            value.has("bool") -> value.getBoolean("bool")
+            else -> {
+                // Bare object — treat as nested map with string keys.
+                val out = mutableMapOf<String, Any?>()
+                for (k in value.keys()) out[k] = decodeFieldValue(value.get(k))
+                out
+            }
+        }
+        is JSONArray -> {
+            val out = mutableListOf<Any?>()
+            for (i in 0 until value.length()) out.add(decodeFieldValue(value.get(i)))
+            out
+        }
+        else -> value
+    }
+}
+
+private fun decodeFieldsParam(params: JSONObject): MutableMap<Int, Any> {
+    val raw = params.optJSONObject("fields") ?: return mutableMapOf()
+    val out = mutableMapOf<Int, Any>()
+    for (k in raw.keys()) {
+        val decoded = decodeFieldValue(raw.get(k))
+            ?: continue // null leaves don't survive into LXMF anyway
+        out[k.toInt()] = decoded
+    }
+    return out
+}
+
+// Encoder: convert ByteArray -> hex so the value is JSON-safe. Mirrors
+// the python bridge's _encode_field_value_for_inbox; the test suite
+// asserts on hex strings (not the tagged form) when reading the inbox.
+private fun encodeFieldValueForInbox(value: Any?): Any? {
+    return when (value) {
+        null -> JSONObject.NULL
+        is ByteArray -> value.toHexString()
+        is List<*> -> JSONArray().also { arr ->
+            for (item in value) arr.put(encodeFieldValueForInbox(item))
+        }
+        is Map<*, *> -> JSONObject().also { obj ->
+            for ((k, v) in value) obj.put(k.toString(), encodeFieldValueForInbox(v))
+        }
+        is Long, is Int, is Double, is Float, is Boolean, is String -> value
+        // Anything else: stringify to keep JSON valid; loud failure is
+        // better than silently dropping the value.
+        else -> value.toString()
+    }
+}
+
+private fun encodeMessageFields(message: LXMessage): JSONObject {
+    val out = JSONObject()
+    for ((k, v) in message.fields) {
+        out.put(k.toString(), encodeFieldValueForInbox(v))
+    }
+    return out
+}
+
+// ----------------------------------------------------------------------
 // Command handlers
 // ----------------------------------------------------------------------
 
@@ -175,7 +258,7 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
         entry.put("method", methodToString(message.method))
         entry.put("ack_status", "received")
         entry.put("received_at_ms", System.currentTimeMillis())
-        entry.put("fields", JSONObject()) // Phase 1: no field encoding needed for current tests
+        entry.put("fields", encodeMessageFields(message))
         BridgeState.inboxLock.withLock {
             BridgeState.inbox.add(entry)
         }
@@ -273,6 +356,7 @@ private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject {
         source = source,
         content = content,
         title = title,
+        fields = decodeFieldsParam(params),
         desiredMethod = DeliveryMethod.OPPORTUNISTIC,
     )
     // Per-message callbacks so we can track state transitions.
@@ -308,6 +392,7 @@ private fun cmdLxmfSendDirect(params: JSONObject): JSONObject {
         source = source,
         content = content,
         title = title,
+        fields = decodeFieldsParam(params),
         desiredMethod = DeliveryMethod.DIRECT,
     )
     message.deliveryCallback = { m ->
@@ -381,6 +466,7 @@ private fun cmdLxmfSendPropagated(params: JSONObject): JSONObject {
         source = source,
         content = content,
         title = title,
+        fields = decodeFieldsParam(params),
         desiredMethod = DeliveryMethod.PROPAGATED,
     )
     message.deliveryCallback = { m ->
