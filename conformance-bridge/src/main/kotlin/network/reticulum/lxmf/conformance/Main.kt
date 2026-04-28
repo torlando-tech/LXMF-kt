@@ -790,6 +790,15 @@ fun main() {
     out.println("READY")
     out.flush()
 
+    // After READY, hijack System.out and route subsequent stdout writes
+    // to stderr. The JSON-RPC channel uses our captured `out` directly,
+    // so this only redirects unstructured prints. Without this, every
+    // `println(...)` in lxmf-kt / reticulum-kt leaks onto the response
+    // channel and the test harness silently drops it as non-JSON, so
+    // bugs in the underlying stack are completely invisible to anyone
+    // running the conformance suite.
+    System.setOut(java.io.PrintStream(System.err, true))
+
     while (true) {
         val line = try { reader.readLine() } catch (e: Exception) { null }
         if (line == null) break
