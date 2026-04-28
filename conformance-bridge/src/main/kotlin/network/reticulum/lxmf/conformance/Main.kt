@@ -389,6 +389,28 @@ private fun cmdLxmfAddTcpServerInterface(params: JSONObject): JSONObject {
         bindAddress = "127.0.0.1",
         bindPort = bindPort,
     )
+
+    // Register each spawned child interface with Transport BEFORE start()
+    // opens the accept loop. The parent TCPServerInterface's processOutgoing
+    // is intentionally a no-op (post-#46) so that Transport routes outbound
+    // packets via the spawned child that owns the actual socket. If the
+    // spawned child isn't registered with Transport, findInterfaceByHash
+    // returns null when an outbound link packet looks up its receiving
+    // interface — and the packet is silently dropped. This manifests as
+    // any DIRECT-from-this-bridge LXMF send appearing to "succeed" (link
+    // handshake completes) while the receiver never sees the data packet.
+    // Mirrors the equivalent wiring in Columba's NativeInterfaceFactory.kt
+    // and reticulum-kt PR #47.
+    iface.onClientConnected = { spawned ->
+        runCatching {
+            Transport.registerInterface(spawned.toRef())
+        }.onFailure { e ->
+            System.err.println(
+                "[bridge] Failed to register spawned client ${spawned.name}: ${e.message}"
+            )
+        }
+    }
+
     iface.start()
     Transport.registerInterface(iface.toRef())
     BridgeState.interfaces.add(iface)
