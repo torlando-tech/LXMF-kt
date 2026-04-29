@@ -11,6 +11,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
@@ -78,7 +79,7 @@ private object BridgeState {
     @Volatile var shuttingDown: Boolean = false
 
     // Started TCP interfaces (for shutdown).
-    val interfaces = mutableListOf<Any>()
+    val interfaces = mutableListOf<Interface>()
 }
 
 // ----------------------------------------------------------------------
@@ -612,10 +613,7 @@ private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
         stopped = true
     }
     for (iface in BridgeState.interfaces) {
-        try {
-            val m = iface.javaClass.getMethod("detach")
-            m.invoke(iface)
-        } catch (_: Throwable) {}
+        try { iface.detach() } catch (_: Throwable) {}
     }
     BridgeState.interfaces.clear()
     try { Reticulum.stop() } catch (_: Throwable) {}
