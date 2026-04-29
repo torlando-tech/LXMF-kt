@@ -374,7 +374,24 @@ class LXMRouterTest {
         // Force immediate retry by clearing next attempt time
         message.nextDeliveryAttempt = null
 
+        // handleOutbound triggers processOutbound asynchronously via
+        // processingScope.launch — running our own processOutbound right
+        // here can race the launched one (whichever wins
+        // outboundProcessingMutex.tryLock first; the loser no-ops). After
+        // the stuck-link rewrite the synchronous-fail path now lives
+        // inside the no-link branch of processDirectDelivery (post-fix
+        // behavior: increment attempts, observe > MAX, set FAILED, return).
+        // Drive the loop and then poll for the terminal state so the
+        // assertion isn't ordering-dependent.
         router.processOutbound()
+        kotlinx.coroutines.withTimeout(5_000) {
+            while (message.state != MessageState.FAILED &&
+                message.state != MessageState.DELIVERED
+            ) {
+                kotlinx.coroutines.delay(50)
+                router.processOutbound()
+            }
+        }
 
         // Should be FAILED after exceeding max attempts
         assertEquals(MessageState.FAILED, message.state)
