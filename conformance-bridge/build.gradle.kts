@@ -13,8 +13,8 @@ dependencies {
     // the rns-core bump in lxmf-core/build.gradle.kts:23. Mismatch caused
     // the bridge to ship an older Resource implementation than what the
     // tests against the bridge actually exercise.
-    implementation("com.github.torlando-tech.reticulum-kt:rns-core:v0.0.15")
-    implementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:v0.0.15")
+    implementation("com.github.torlando-tech.reticulum-kt:rns-core:fix~transport-release-lock-before-tcp-write-SNAPSHOT")
+    implementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:fix~transport-release-lock-before-tcp-write-SNAPSHOT")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
     implementation("org.json:json:20231013")
