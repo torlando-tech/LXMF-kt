@@ -2,6 +2,7 @@ package network.reticulum.lxmf
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -384,11 +385,11 @@ class LXMRouterTest {
         // Drive the loop and then poll for the terminal state so the
         // assertion isn't ordering-dependent.
         router.processOutbound()
-        kotlinx.coroutines.withTimeout(5_000) {
+        withTimeout(5_000) {
             while (message.state != MessageState.FAILED &&
                 message.state != MessageState.DELIVERED
             ) {
-                kotlinx.coroutines.delay(50)
+                delay(50)
                 router.processOutbound()
             }
         }

@@ -965,6 +965,18 @@ class LXMRouter(
 
                         // Notify messages that need this link
                         handleLinkClosed(destHashHex)
+
+                        // Symmetric with establishedCallback above —
+                        // when the link watchdog tears down a stuck
+                        // PENDING link, the message stays in OUTBOUND
+                        // and `handleLinkClosed` skips it (it only
+                        // resets SENDING). Without this kick the next
+                        // retry waits silently for the periodic
+                        // PROCESSING_INTERVAL (4s) tick. Restart the
+                        // dispatch loop now so the no-link branch can
+                        // bump deliveryAttempts and reach FAILED via
+                        // MAX_DELIVERY_ATTEMPTS without 4s of dead air.
+                        triggerProcessing()
                     },
                 )
 
