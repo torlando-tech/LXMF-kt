@@ -410,6 +410,18 @@ private fun cmdLxmfAddTcpServerInterface(params: JSONObject): JSONObject {
             )
         }
     }
+    // Symmetric deregister so a long-running bridge with repeated
+    // connect/disconnect cycles doesn't accumulate stale closed-socket
+    // entries in Transport.interfaces. The upstream
+    // TCPServerInterface.clientDisconnected (rns-interfaces v0.0.15+)
+    // already invokes Transport.deregisterInterface internally on the
+    // child it owns; this hook is a belt-and-suspenders second call to
+    // the same API, idempotent if the child was already removed.
+    iface.onClientDisconnected = { spawned ->
+        runCatching {
+            Transport.deregisterInterface(spawned.toRef())
+        }
+    }
 
     iface.start()
     Transport.registerInterface(iface.toRef())
@@ -806,20 +818,27 @@ fun main() {
     System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn")
     System.setProperty("org.slf4j.simpleLogger.logFile", "System.err")
 
+    // Capture original stdout / stderr by reference. Using these
+    // references for the JSON-RPC channel and for the redirect target
+    // keeps both stable even if a future test framework swaps the
+    // System.out / System.err globals out from under us.
     val out = System.out
+    val err = System.err
     val reader = BufferedReader(InputStreamReader(System.`in`))
 
     out.println("READY")
     out.flush()
 
     // After READY, hijack System.out and route subsequent stdout writes
-    // to stderr. The JSON-RPC channel uses our captured `out` directly,
+    // to stderr. The JSON-RPC channel uses the captured `out` directly,
     // so this only redirects unstructured prints. Without this, every
     // `println(...)` in lxmf-kt / reticulum-kt leaks onto the response
     // channel and the test harness silently drops it as non-JSON, so
     // bugs in the underlying stack are completely invisible to anyone
-    // running the conformance suite.
-    System.setOut(java.io.PrintStream(System.err, true))
+    // running the conformance suite. We point to the captured `err`
+    // reference so a future System.err swap doesn't redirect us
+    // somewhere unexpected.
+    System.setOut(err)
 
     while (true) {
         val line = try { reader.readLine() } catch (e: Exception) { null }
