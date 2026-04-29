@@ -278,6 +278,16 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
         )
     }
 
+    // Reset shuttingDown — `cmdLxmfShutdown` sets it true to gate late
+    // callbacks from repopulating cleared collections, but it stays true
+    // forever otherwise. If a caller invokes `lxmf_init` again after
+    // `lxmf_shutdown` (even though the contract is one-shot per process,
+    // we don't want a stale flag to silently no-op every callback that
+    // checks it). The router-null guard above protects against the
+    // intended-one-shot violation; this just makes the state clean if
+    // it does happen.
+    BridgeState.shuttingDown = false
+
     val storagePath = params.optString("storage_path", "")
         .ifEmpty { Files.createTempDirectory("lxmf_conf_storage_").toAbsolutePath().toString() }
     val configDir = Files.createTempDirectory("lxmf_conf_rns_").toAbsolutePath().toString()
@@ -326,12 +336,7 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
             // cmdLxmfShutdown cleared the inbox. Otherwise they re-add
             // the entry and the next test sees stale state.
             if (BridgeState.shuttingDown) return@registerDeliveryCallback
-            val seq = BridgeState.inboxLock.withLock {
-                BridgeState.inboxSeq += 1
-                BridgeState.inboxSeq
-            }
             val entry = JSONObject()
-            entry.put("seq", seq)
             entry.put("message_hash", message.hash?.toHexString() ?: "")
             entry.put("source_hash", message.sourceHash.toHexString())
             entry.put("destination_hash", message.destinationHash.toHexString())
@@ -341,7 +346,14 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
             entry.put("ack_status", "received")
             entry.put("received_at_ms", System.currentTimeMillis())
             entry.put("fields", encodeMessageFields(message))
+            // Increment seq AND add to inbox under a single lock acquisition.
+            // Splitting them across two `withLock` blocks lets a poll between
+            // the two release `last_seq=N` (already incremented) without the
+            // entry seq=N in inbox — the next poll advances `since_seq` past
+            // it and the entry is silently dropped.
             BridgeState.inboxLock.withLock {
+                BridgeState.inboxSeq += 1
+                entry.put("seq", BridgeState.inboxSeq)
                 BridgeState.inbox.add(entry)
             }
         }
@@ -595,6 +607,20 @@ private val BUSY_PROPAGATION_STATES = setOf(
     LXMRouter.PropagationTransferState.RECEIVING_MESSAGES,
 )
 
+/**
+ * Block until propagation sync is quiescent or the timeout expires.
+ *
+ * NOTE on the dispatch loop: this command is intentionally synchronous,
+ * which means while we sleep/poll here the bridge's stdin dispatch loop
+ * (`fun main()` while-loop) cannot service further commands until we
+ * return. That's the contract — the conformance harness sends
+ * `lxmf_sync_inbound` and waits for the result before proceeding, and
+ * tests are sequenced one-command-at-a-time per bridge subprocess. If
+ * the contract ever changes to allow concurrent commands while a sync
+ * is in flight, this would need to dispatch the wait to a worker thread
+ * and report completion via a separate poll command. For today's usage
+ * the blocking shape is the right model.
+ */
 private fun cmdLxmfSyncInbound(params: JSONObject): JSONObject {
     val router = ensureRouter("lxmf_sync_inbound")
     val timeoutSec = params.optDouble("timeout_sec", 30.0)
