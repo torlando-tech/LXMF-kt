@@ -468,8 +468,19 @@ private fun makeOutboundDelivery(destHashHex: String): Destination {
     )
 }
 
-private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject {
-    val router = ensureRouter("lxmf_send_opportunistic")
+/**
+ * Shared body for the three lxmf_send_* JSON-RPC commands. They differ
+ * only in the DeliveryMethod enum value and the routerErrorTag used in
+ * the not-yet-initialised error message. Keeping the shape in one place
+ * means callback wiring, hash recording, and the
+ * runBlocking-handleOutbound boundary can't drift between methods.
+ */
+private fun cmdLxmfSendCommon(
+    params: JSONObject,
+    method: DeliveryMethod,
+    routerErrorTag: String,
+): JSONObject {
+    val router = ensureRouter(routerErrorTag)
     val source = BridgeState.deliveryDestination
         ?: throw IllegalStateException("source delivery destination not registered")
 
@@ -485,7 +496,7 @@ private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject {
         content = content,
         title = title,
         fields = decodeFieldsParam(params),
-        desiredMethod = DeliveryMethod.OPPORTUNISTIC,
+        desiredMethod = method,
     )
     // Per-message callbacks so we can track state transitions.
     message.deliveryCallback = { m ->
@@ -504,40 +515,11 @@ private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject {
     return JSONObject().put("message_hash", msgHashHex)
 }
 
-private fun cmdLxmfSendDirect(params: JSONObject): JSONObject {
-    val router = ensureRouter("lxmf_send_direct")
-    val source = BridgeState.deliveryDestination
-        ?: throw IllegalStateException("source delivery destination not registered")
+private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject =
+    cmdLxmfSendCommon(params, DeliveryMethod.OPPORTUNISTIC, "lxmf_send_opportunistic")
 
-    val destHashHex = params.getString("destination_hash")
-    val content = params.getString("content")
-    val title = params.optString("title", "")
-
-    val recipientDestination = makeOutboundDelivery(destHashHex)
-
-    val message = LXMessage.create(
-        destination = recipientDestination,
-        source = source,
-        content = content,
-        title = title,
-        fields = decodeFieldsParam(params),
-        desiredMethod = DeliveryMethod.DIRECT,
-    )
-    message.deliveryCallback = { m ->
-        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
-    }
-    message.failedCallback = { m ->
-        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
-    }
-
-    runBlocking { router.handleOutbound(message) }
-    val msgHashHex = message.hash?.toHexString() ?: ""
-    if (msgHashHex.isNotEmpty()) {
-        recordOutboundState(msgHashHex, stateToString(message.state))
-    }
-
-    return JSONObject().put("message_hash", msgHashHex)
-}
+private fun cmdLxmfSendDirect(params: JSONObject): JSONObject =
+    cmdLxmfSendCommon(params, DeliveryMethod.DIRECT, "lxmf_send_direct")
 
 // ----------------------------------------------------------------------
 // Path probing
@@ -578,39 +560,8 @@ private fun cmdLxmfSetOutboundPropagationNode(params: JSONObject): JSONObject {
     return JSONObject().put("ok", true)
 }
 
-private fun cmdLxmfSendPropagated(params: JSONObject): JSONObject {
-    val router = ensureRouter("lxmf_send_propagated")
-    val source = BridgeState.deliveryDestination
-        ?: throw IllegalStateException("source delivery destination not registered")
-
-    val destHashHex = params.getString("destination_hash")
-    val content = params.getString("content")
-    val title = params.optString("title", "")
-
-    val recipientDestination = makeOutboundDelivery(destHashHex)
-
-    val message = LXMessage.create(
-        destination = recipientDestination,
-        source = source,
-        content = content,
-        title = title,
-        fields = decodeFieldsParam(params),
-        desiredMethod = DeliveryMethod.PROPAGATED,
-    )
-    message.deliveryCallback = { m ->
-        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
-    }
-    message.failedCallback = { m ->
-        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
-    }
-
-    runBlocking { router.handleOutbound(message) }
-    val msgHashHex = message.hash?.toHexString() ?: ""
-    if (msgHashHex.isNotEmpty()) {
-        recordOutboundState(msgHashHex, stateToString(message.state))
-    }
-    return JSONObject().put("message_hash", msgHashHex)
-}
+private fun cmdLxmfSendPropagated(params: JSONObject): JSONObject =
+    cmdLxmfSendCommon(params, DeliveryMethod.PROPAGATED, "lxmf_send_propagated")
 
 // Terminal states: COMPLETE, FAILED, NO_PATH, NO_LINK.
 //
@@ -672,12 +623,16 @@ private fun cmdLxmfSyncInbound(params: JSONObject): JSONObject {
         val terminalNow = finalState in TERMINAL_PROPAGATION_STATES ||
             (sawBusy && finalState == LXMRouter.PropagationTransferState.IDLE)
         if (terminalNow) {
-            // Brief settle so an in-flight transfer that hasn't yet
-            // raised its state has a chance to be observed before we
-            // bail. Mirrors the python bridge's 0.5s tail.
+            // Capture the terminal state BEFORE the settle. A COMPLETE
+            // state normally cycles to IDLE during the brief settle
+            // window; if we then re-read, we'd return "idle" and a
+            // fixture that asserts "complete" would treat the sync as
+            // never having started. Mirrors the python bridge's 0.5s
+            // tail for in-flight observability without using the
+            // post-settle value for the return.
+            val terminalState = finalState
             Thread.sleep(500)
-            finalState = router.propagationTransferState
-            break
+            return JSONObject().put("final_state", terminalState.name.lowercase())
         }
         Thread.sleep(200)
     }
