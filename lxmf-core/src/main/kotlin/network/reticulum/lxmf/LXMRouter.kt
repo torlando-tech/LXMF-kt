@@ -58,13 +58,6 @@ class LXMRouter(
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
 
-        /**
-         * Retry pending direct links after this long.
-         * This prevents a link request sent before path discovery completes
-         * from remaining stuck in PENDING for the full link watchdog timeout.
-         */
-        const val PENDING_LINK_RETRY_TIMEOUT = 15000L
-
         /** Maximum pathless delivery attempts before requesting path */
         const val MAX_PATHLESS_TRIES = 1
 
@@ -826,12 +819,28 @@ class LXMRouter(
 
     /**
      * Process direct link-based message delivery.
+     *
+     * Matches Python LXMF LXMRouter.py lines 2578-2655:
+     *  - PENDING link → wait passively (do not retry, do not increment attempts).
+     *    reticulum-kt's Link watchdog runs its own establishment timeout
+     *    (ESTABLISHMENT_TIMEOUT_PER_HOP × hops). When that fires, the link's
+     *    closedCallback removes the entry from `directLinks` and the next tick
+     *    creates a fresh attempt.
+     *  - CLOSED link → clear the dead entry and schedule a retry.
+     *  - No link → bump `deliveryAttempts` and attempt to establish a new one.
+     *
+     * Previous behaviour incremented `deliveryAttempts` unconditionally on
+     * every entry, eagerly tore down PENDING links after 15s (racing the Link
+     * watchdog and resetting the establishment clock), and—critically—failed
+     * messages without invoking `failedCallback`, which silently swallowed the
+     * "DIRECT failed → fall back to PROPAGATED" hook in upstream callers.
      */
     private suspend fun processDirectDelivery(message: LXMessage) {
-        message.deliveryAttempts++
-
+        // Check max delivery attempts FIRST. Always invoke failedCallback so
+        // upstream consumers (e.g. propagation fallback) get notified.
         if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
             message.state = MessageState.FAILED
+            message.failedCallback?.invoke(message)
             return
         }
 
@@ -873,33 +882,37 @@ class LXMRouter(
             }
 
             link != null && link.status == LinkConstants.PENDING -> {
-                val pendingSince = pendingLinkEstablishments[destHashHex]
-                val pendingAge = pendingSince?.let { System.currentTimeMillis() - it } ?: 0L
-                val hasPathNow = Transport.hasPath(message.destinationHash)
-
-                if (hasPathNow && pendingAge >= PENDING_LINK_RETRY_TIMEOUT) {
-                    println(
-                        "[LXMRouter] processDirectDelivery: pending link for $destHashHex has been stuck for ${pendingAge}ms; tearing down and re-establishing now that a path exists",
-                    )
-                    directLinks.remove(destHashHex)
-                    pendingLinkEstablishments.remove(destHashHex)
-                    link.teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
-                    establishLinkForMessage(message)
-                } else {
-                    // Link is being established, wait
-                    message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
-                }
+                // Wait for the link to activate or close. The Link watchdog will
+                // fire teardown on its own establishment timeout; closedCallback
+                // then removes the entry so the next tick creates a fresh
+                // attempt. (Python LXMRouter.py:2630-2632.)
             }
 
             link != null && link.status == LinkConstants.CLOSED -> {
-                // Link is closed, remove and try to establish new one
+                // Link is closed (likely establishment timeout). Clear it and
+                // schedule a retry; the next tick will hit the no-link branch
+                // and bump deliveryAttempts. (Python LXMRouter.py:2625-2629.)
                 directLinks.remove(destHashHex)
-                establishLinkForMessage(message)
+                pendingLinkEstablishments.remove(destHashHex)
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
 
             else -> {
-                // No link exists, establish one
-                establishLinkForMessage(message)
+                // No link exists. Bump attempts and try to create one — but
+                // only after the retry-wait window has elapsed, so we don't
+                // burn the budget on rapid-fire ticks. (Python LXMRouter.py:2637-2639.)
+                val now = System.currentTimeMillis()
+                val nextAttempt = message.nextDeliveryAttempt ?: 0L
+                if (nextAttempt == 0L || now >= nextAttempt) {
+                    message.deliveryAttempts++
+                    if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
+                        message.state = MessageState.FAILED
+                        message.failedCallback?.invoke(message)
+                        return
+                    }
+                    message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
+                    establishLinkForMessage(message)
+                }
             }
         }
     }
@@ -952,6 +965,18 @@ class LXMRouter(
 
                         // Notify messages that need this link
                         handleLinkClosed(destHashHex)
+
+                        // Symmetric with establishedCallback above —
+                        // when the link watchdog tears down a stuck
+                        // PENDING link, the message stays in OUTBOUND
+                        // and `handleLinkClosed` skips it (it only
+                        // resets SENDING). Without this kick the next
+                        // retry waits silently for the periodic
+                        // PROCESSING_INTERVAL (4s) tick. Restart the
+                        // dispatch loop now so the no-link branch can
+                        // bump deliveryAttempts and reach FAILED via
+                        // MAX_DELIVERY_ATTEMPTS without 4s of dead air.
+                        triggerProcessing()
                     },
                 )
 
@@ -1077,9 +1102,11 @@ class LXMRouter(
             return
         }
 
-        // Check max delivery attempts (Python line 2673)
+        // Check max delivery attempts (Python line 2673). Fire failedCallback so
+        // upstream consumers (e.g. UI status updates, fallback policies) get notified.
         if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
             message.state = MessageState.FAILED
+            message.failedCallback?.invoke(message)
             return
         }
 
@@ -1119,6 +1146,7 @@ class LXMRouter(
                         establishPropagationLink(node, forRetrieval = false)
                     } else {
                         message.state = MessageState.FAILED
+                        message.failedCallback?.invoke(message)
                     }
                 }
             }

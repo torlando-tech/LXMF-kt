@@ -2,6 +2,7 @@ package network.reticulum.lxmf
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -366,6 +367,12 @@ class LXMRouterTest {
             desiredMethod = DeliveryMethod.DIRECT
         )
 
+        // The primary fix in this PR is invoking failedCallback on every
+        // FAILED transition. Capture invocation so a future regression
+        // that drops the call again breaks loudly here.
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        message.failedCallback = { callbackFired.set(true) }
+
         // Set delivery attempts to max
         message.deliveryAttempts = LXMRouter.MAX_DELIVERY_ATTEMPTS
 
@@ -374,10 +381,87 @@ class LXMRouterTest {
         // Force immediate retry by clearing next attempt time
         message.nextDeliveryAttempt = null
 
+        // handleOutbound triggers processOutbound asynchronously via
+        // processingScope.launch — running our own processOutbound right
+        // here can race the launched one (whichever wins
+        // outboundProcessingMutex.tryLock first; the loser no-ops). After
+        // the stuck-link rewrite the synchronous-fail path now lives
+        // inside the no-link branch of processDirectDelivery (post-fix
+        // behavior: increment attempts, observe > MAX, set FAILED, return).
+        // Drive the loop and then poll for the terminal state so the
+        // assertion isn't ordering-dependent.
         router.processOutbound()
+        withTimeout(5_000) {
+            while (message.state != MessageState.FAILED &&
+                message.state != MessageState.DELIVERED
+            ) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
 
         // Should be FAILED after exceeding max attempts
         assertEquals(MessageState.FAILED, message.state)
+        assertTrue(
+            callbackFired.get(),
+            "failedCallback must be invoked on FAILED transition (the primary fix)",
+        )
+    }
+
+    @Test
+    fun `test propagated delivery without propagation node fires failedCallback`() = runBlocking {
+        // Covers the no-node branch of processPropagatedDelivery
+        // (node == null → state = FAILED). This is one of three new
+        // failedCallback?.invoke sites the PR adds; the other two
+        // (deliveryAttempts > MAX early exit, and the no-link
+        // bump-past-max branch) require a stubbed PN to drive and
+        // are not exercised here. Naming kept narrow to reflect that.
+        val destIdentity = Identity.create()
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test",
+            desiredMethod = DeliveryMethod.PROPAGATED
+        )
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        message.failedCallback = { callbackFired.set(true) }
+
+        // No active propagation node → processPropagatedDelivery's first
+        // branch should set FAILED and invoke failedCallback.
+        assertNull(router.getActivePropagationNode())
+
+        router.handleOutbound(message)
+        message.nextDeliveryAttempt = null
+        router.processOutbound()
+        withTimeout(5_000) {
+            while (message.state != MessageState.FAILED &&
+                message.state != MessageState.DELIVERED
+            ) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
+
+        assertEquals(MessageState.FAILED, message.state)
+        assertTrue(
+            callbackFired.get(),
+            "failedCallback must be invoked when no propagation node is configured",
+        )
     }
 
     // ===== Propagation Node Tests =====
