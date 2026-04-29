@@ -2133,10 +2133,16 @@ class LXMRouter(
                         outboundPropagationLink = establishedLink
                         propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
 
-                        // Identify ourselves on the link
-                        identifyOnLink(establishedLink)
-
                         if (forRetrieval) {
+                            // Retrieval path identifies on the link so the PN
+                            // can locate the requesting peer's queued messages.
+                            // Mirrors python `request_messages_from_propagation_node`
+                            // at LXMRouter.py:493 (`self.outbound_propagation_link
+                            // .identify(identity)`). The delivery path
+                            // intentionally does NOT identify — see the
+                            // matching comment below for rationale.
+                            identifyOnLink(establishedLink)
+
                             // Retrieval path: request message list (Python line 510)
                             // The identify packet may not have been processed yet by the
                             // remote node. If we get ERROR_NO_IDENTITY, handleMessageListResponse
@@ -2144,6 +2150,25 @@ class LXMRouter(
                             println("[LXMRouter] Calling requestMessageList on established link")
                             requestMessageList(establishedLink)
                         } else {
+                            // Delivery path: do NOT identify on the link.
+                            // Mirrors python `process_outbound` for PROPAGATED
+                            // at LXMRouter.py:2700-2704 — python establishes
+                            // `RNS.Link(propagation_node_destination, ...)`
+                            // and goes straight to sending the resource without
+                            // calling `link.identify(...)`.
+                            //
+                            // Identifying on the delivery link causes lxmd's
+                            // `propagation_resource_concluded` (LXMRouter.py:
+                            // 2188-2214) to run the peer-discovery branch
+                            // (`remote_destination = RNS.Destination(remote_identity,
+                            // OUT, SINGLE, "lxmf", "propagation")` then
+                            // `recall_app_data(remote_hash)`), which probes
+                            // global state during the resource conclusion path
+                            // and can stall the proof emission. Python avoids
+                            // this by leaving the link unidentified for
+                            // delivery — the message itself carries enough
+                            // routing info via its embedded recipient
+                            // destination hash.
                             // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
                             processingScope.launch {
                                 // Reset nextDeliveryAttempt for pending PROPAGATED messages so they get processed immediately.
