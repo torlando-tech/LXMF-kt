@@ -107,6 +107,27 @@ private fun methodToString(method: DeliveryMethod?): String =
         else -> "unknown"
     }
 
+/**
+ * Pick an OS-assigned ephemeral port by binding then immediately closing
+ * a probe socket.
+ *
+ * There is a small TOCTOU race here: between this function returning and
+ * `TCPServerInterface.start()` actually binding to the returned port,
+ * another process could in principle claim it. In practice this is a
+ * non-issue for the conformance bridge:
+ *
+ *   - GitHub Actions runners isolate jobs onto separate VMs, so parallel
+ *     CI jobs cannot race for the same loopback port.
+ *   - Within a single bridge process this function is called serially,
+ *     <1ms before TCPServerInterface binds — the kernel doesn't reassign
+ *     a freshly-released ephemeral port that fast.
+ *
+ * If the upstream TCPServerInterface API ever gains support for reading
+ * back its actual bound port after `start()` (analogous to ServerSocket's
+ * `localPort` once `bind()` returns), we could pass `bindPort = 0` and
+ * read the assignment back, eliminating the race entirely. Until then,
+ * this is the cheapest workable approximation.
+ */
 private fun allocateFreePort(): Int {
     val s = ServerSocket()
     return try {
@@ -196,7 +217,15 @@ private fun decodeFieldsParam(params: JSONObject): MutableMap<Int, Any> {
     for (k in raw.keys()) {
         val decoded = decodeFieldValue(raw.get(k))
             ?: continue // null leaves don't survive into LXMF anyway
-        out[k.toInt()] = decoded
+        // LXMF field IDs are decimal strings on the JSON-RPC wire. Surface
+        // a clear validation error rather than leaking NumberFormatException
+        // up through handleRequest, which would otherwise present as a raw
+        // JVM stack trace to the test harness on a malformed payload.
+        val id = k.toIntOrNull()
+            ?: throw IllegalArgumentException(
+                "fields key '$k' is not a decimal integer (LXMF field IDs are 0..255)",
+            )
+        out[id] = decoded
     }
     return out
 }
@@ -541,17 +570,29 @@ private fun cmdLxmfSendPropagated(params: JSONObject): JSONObject {
     return JSONObject().put("message_hash", msgHashHex)
 }
 
-// Treat as terminal: anything where the router is no longer actively
-// driving a transfer. COMPLETE = success; FAILED/NO_PATH/NO_LINK =
-// terminal failure; IDLE = transfer drained back to rest. The python
-// bridge treats {None, 0, -1} as terminal and bails on the first one
-// observed; this mirrors that.
+// Terminal states: COMPLETE, FAILED, NO_PATH, NO_LINK.
+//
+// IDLE is intentionally NOT in this set. IDLE is also the router's
+// default resting state BEFORE a transfer begins, so if we read the
+// state before requestMessagesFromPropagationNode() has had a chance
+// to advance it past IDLE, we'd exit immediately and report
+// "final_state=idle" without the transfer having run at all. We track
+// "saw busy" separately and only treat IDLE as terminal once a busy
+// state was observed.
 private val TERMINAL_PROPAGATION_STATES = setOf(
-    LXMRouter.PropagationTransferState.IDLE,
     LXMRouter.PropagationTransferState.COMPLETE,
     LXMRouter.PropagationTransferState.FAILED,
     LXMRouter.PropagationTransferState.NO_PATH,
     LXMRouter.PropagationTransferState.NO_LINK,
+)
+
+private val BUSY_PROPAGATION_STATES = setOf(
+    LXMRouter.PropagationTransferState.PATH_REQUESTED,
+    LXMRouter.PropagationTransferState.LINK_ESTABLISHING,
+    LXMRouter.PropagationTransferState.LINK_ESTABLISHED,
+    LXMRouter.PropagationTransferState.LISTING_MESSAGES,
+    LXMRouter.PropagationTransferState.REQUESTING_MESSAGES,
+    LXMRouter.PropagationTransferState.RECEIVING_MESSAGES,
 )
 
 private fun cmdLxmfSyncInbound(params: JSONObject): JSONObject {
@@ -562,9 +603,19 @@ private fun cmdLxmfSyncInbound(params: JSONObject): JSONObject {
 
     val deadlineMs = System.currentTimeMillis() + (timeoutSec * 1000).toLong()
     var finalState = router.propagationTransferState
+    var sawBusy = false
     while (System.currentTimeMillis() < deadlineMs) {
         finalState = router.propagationTransferState
-        if (finalState in TERMINAL_PROPAGATION_STATES) {
+        if (finalState in BUSY_PROPAGATION_STATES) {
+            sawBusy = true
+        }
+        // Hard terminal: COMPLETE / FAILED / NO_PATH / NO_LINK — exit immediately.
+        // Soft terminal: IDLE only counts after a busy state was seen, so we
+        // don't bail on the pre-transfer resting state before the request has
+        // had a chance to schedule any work.
+        val terminalNow = finalState in TERMINAL_PROPAGATION_STATES ||
+            (sawBusy && finalState == LXMRouter.PropagationTransferState.IDLE)
+        if (terminalNow) {
             // Brief settle so an in-flight transfer that hasn't yet
             // raised its state has a chance to be observed before we
             // bail. Mirrors the python bridge's 0.5s tail.
