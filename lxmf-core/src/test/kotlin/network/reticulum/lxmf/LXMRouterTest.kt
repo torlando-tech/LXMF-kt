@@ -367,6 +367,12 @@ class LXMRouterTest {
             desiredMethod = DeliveryMethod.DIRECT
         )
 
+        // The primary fix in this PR is invoking failedCallback on every
+        // FAILED transition. Capture invocation so a future regression
+        // that drops the call again breaks loudly here.
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        message.failedCallback = { callbackFired.set(true) }
+
         // Set delivery attempts to max
         message.deliveryAttempts = LXMRouter.MAX_DELIVERY_ATTEMPTS
 
@@ -396,6 +402,67 @@ class LXMRouterTest {
 
         // Should be FAILED after exceeding max attempts
         assertEquals(MessageState.FAILED, message.state)
+        assertTrue(
+            callbackFired.get(),
+            "failedCallback must be invoked on FAILED transition (the primary fix)",
+        )
+    }
+
+    @Test
+    fun `test propagated max delivery attempts fires failedCallback`() = runBlocking {
+        // Mirror of the DIRECT test for the parallel PROPAGATED path. The
+        // PR adds failedCallback?.invoke at three sites in
+        // processPropagatedDelivery (no-node, max-attempts early exit,
+        // no-link bump-past-max). With no active propagation node configured,
+        // the no-node path fires immediately — that's the cheapest of the
+        // three to drive without standing up a full PN harness, and it
+        // exercises the same callback-invocation invariant.
+        val destIdentity = Identity.create()
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test",
+            desiredMethod = DeliveryMethod.PROPAGATED
+        )
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        message.failedCallback = { callbackFired.set(true) }
+
+        // No active propagation node → processPropagatedDelivery's first
+        // branch should set FAILED and invoke failedCallback.
+        assertNull(router.getActivePropagationNode())
+
+        router.handleOutbound(message)
+        message.nextDeliveryAttempt = null
+        router.processOutbound()
+        withTimeout(5_000) {
+            while (message.state != MessageState.FAILED &&
+                message.state != MessageState.DELIVERED
+            ) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
+
+        assertEquals(MessageState.FAILED, message.state)
+        assertTrue(
+            callbackFired.get(),
+            "failedCallback must be invoked when no propagation node is configured",
+        )
     }
 
     // ===== Propagation Node Tests =====
