@@ -71,8 +71,21 @@ private object BridgeState {
     val inboxLock = ReentrantLock()
     @Volatile var inboxSeq = 0
 
-    // Outbound message state map: hex -> state name.
+    // Outbound message state map: hex -> state name. Updated by the
+    // per-message deliveryCallback / failedCallback closures plus a
+    // synchronous post-handleOutbound write in each cmdLxmf_send_*.
     val outboundState = ConcurrentHashMap<String, String>()
+
+    // Live LXMessage references keyed by message hash hex. Used by
+    // cmdLxmfGetMessageState to read the *current* state from the
+    // message itself. Required because LXMessage.deliveryCallback only
+    // fires on the terminal transitions the router cares about
+    // (DELIVERED for opportunistic, SENT for propagated): intermediate
+    // transitions like opportunistic OUTBOUND→SENT (no proof yet) or
+    // propagated OUTBOUND→SENDING (link established, transfer in flight)
+    // never fire a callback, so outboundState alone reports stale
+    // 'outbound' for messages that have actually advanced.
+    val outboundMessages = ConcurrentHashMap<String, LXMessage>()
 
     // Set true at the top of cmdLxmfShutdown so any callbacks the router
     // schedules during teardown can't repopulate `outboundState` /
@@ -531,6 +544,13 @@ private fun cmdLxmfSendCommon(
     val msgHashHex = message.hash?.toHexString() ?: ""
     if (msgHashHex.isNotEmpty()) {
         recordOutboundState(msgHashHex, stateToString(message.state))
+        // Keep a live reference so cmdLxmfGetMessageState can read the
+        // current message.state directly. The router advances state
+        // through transitions (OUTBOUND → SENT for opportunistic;
+        // OUTBOUND → SENDING → SENT for propagated) without firing the
+        // deliveryCallback for the intermediate ones, so polling
+        // outboundState alone misses real progress.
+        BridgeState.outboundMessages[msgHashHex] = message
     }
 
     return JSONObject().put("message_hash", msgHashHex)
@@ -678,7 +698,23 @@ private fun cmdLxmfGetReceivedMessages(params: JSONObject): JSONObject {
 private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
     ensureRouter("lxmf_get_message_state")
     val hashHex = params.getString("message_hash")
-    val state = BridgeState.outboundState[hashHex] ?: "unknown"
+    val recordedState = BridgeState.outboundState[hashHex]
+
+    // Prefer the recorded state when it's already terminal — those values
+    // come from the actual deliveryCallback / failedCallback firings and
+    // are authoritative. For non-terminal recorded states (or no record
+    // at all), fall back to the live LXMessage's current state. The
+    // router progresses messages through OUTBOUND → SENDING → SENT →
+    // DELIVERED but only invokes deliveryCallback at terminal-for-method
+    // (DELIVERED for opportunistic, SENT for propagated). The
+    // intermediate transitions never reach the recorded map, so polling
+    // it alone misses progress that already happened on the message.
+    val state = if (recordedState in TERMINAL_OUTBOUND_STATES) {
+        recordedState!!
+    } else {
+        val live = BridgeState.outboundMessages[hashHex]?.state
+        if (live != null) stateToString(live) else (recordedState ?: "unknown")
+    }
     return JSONObject().put("state", state)
 }
 
@@ -722,6 +758,7 @@ private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
         BridgeState.inboxSeq = 0
     }
     BridgeState.outboundState.clear()
+    BridgeState.outboundMessages.clear()
 
     return JSONObject().put("stopped", stopped)
 }
