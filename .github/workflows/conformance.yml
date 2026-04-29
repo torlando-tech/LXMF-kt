@@ -1,0 +1,135 @@
+name: Conformance (vs Python reference)
+
+# Runs the LXMF cross-impl conformance suite against THIS repo's
+# :conformance-bridge JAR, paired with the Python reference bridge.
+#
+# Why this lives here and not in lxmf-conformance: that repo's CI is
+# scoped to "validate the harness itself" (python ↔ python only) so
+# harness-only fixes aren't gated on whichever bridge is furthest
+# behind on command coverage. Per-impl cross-validation belongs in
+# each impl's own repo, where a kotlin regression surfaces against
+# whichever Python LXMF / Reticulum revision this repo happens to
+# pin (or, for the default unpinned run, against `master`).
+#
+# Coverage: every (sender_impl, receiver_impl) pair drawn from
+# {python, kotlin}. The propagation tests additionally spawn a real
+# `lxmd` subprocess as the middle hop, so this CI exercises the
+# kotlin bridge in all three roles (sender, receiver, propagation
+# peer) against a python LXMF / Reticulum.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual runs to test against a specific Python LXMF / RNS
+  # revision (override via the inputs below). markqvist's Reticulum
+  # and LXMF both use `master` as their default branch, so that's
+  # the right default here.
+  workflow_dispatch:
+    inputs:
+      python_lxmf_ref:
+        description: "markqvist/LXMF git ref to test against"
+        default: "master"
+        required: false
+      python_rns_ref:
+        description: "markqvist/Reticulum git ref to test against"
+        default: "master"
+        required: false
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout LXMF-kt
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: LXMF-kt
+
+      - name: Checkout lxmf-conformance
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: torlando-tech/lxmf-conformance
+          path: lxmf-conformance
+
+      - name: Checkout Reticulum (Python reference)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: markqvist/Reticulum
+          ref: ${{ github.event.inputs.python_rns_ref || 'master' }}
+          path: Reticulum
+
+      - name: Checkout LXMF (Python reference)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: markqvist/LXMF
+          ref: ${{ github.event.inputs.python_lxmf_ref || 'master' }}
+          path: LXMF
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        # Restores the Gradle dep cache + wrapper distribution between
+        # runs so we're not re-downloading kotlin-stdlib / shadow / the
+        # rns-core JitPack artifact on every push. Same action+SHA as
+        # tests.yml for consistency.
+        uses: gradle/actions/setup-gradle@94baf225fe0a508e581a564467443d0e2379123b # v4.3.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        # The Python reference bridge in lxmf-conformance imports RNS +
+        # LXMF from PYTHON_RNS_PATH / PYTHON_LXMF_PATH (set in the test
+        # env below) and shells out to `lxmd` for propagation tests, so
+        # we install the runtime deps both libraries need at import time.
+        # `lxmd` itself is a console_script provided by the LXMF source
+        # checkout — installed via `pip install -e $LXMF` below.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-timeout cryptography pyserial msgpack
+          pip install -e ${{ github.workspace }}/LXMF
+
+      - name: Build :conformance-bridge shadowJar
+        working-directory: LXMF-kt
+        # The bridge JAR ends up at conformance-bridge/build/libs/
+        # LXMFConformanceBridge.jar — same path the conformance repo's
+        # default detection looks at via CONFORMANCE_KOTLIN_BRIDGE_CMD.
+        run: ./gradlew :conformance-bridge:shadowJar --stacktrace
+
+      - name: Run conformance suite (python ↔ kotlin)
+        working-directory: lxmf-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+          # Pin the kotlin bridge command explicitly so detection
+          # doesn't depend on relative-path conventions inside the
+          # GitHub Actions checkout layout.
+          CONFORMANCE_KOTLIN_BRIDGE_CMD: >-
+            java -jar ${{ github.workspace }}/LXMF-kt/conformance-bridge/build/libs/LXMFConformanceBridge.jar
+        # --impls python,kotlin generates every (sender × receiver)
+        # combination across the two impls. The harness's python-only
+        # CI proves the harness itself; this run proves THIS bridge
+        # against the harness's python reference.
+        run: python -m pytest tests/ -v --tb=short --impls python,kotlin
+
+      - name: Upload bridge build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conformance-bridge-build
+          path: |
+            LXMF-kt/conformance-bridge/build/reports/
+            LXMF-kt/conformance-bridge/build/test-results/
+          if-no-files-found: ignore
