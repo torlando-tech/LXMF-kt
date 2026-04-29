@@ -71,6 +71,12 @@ private object BridgeState {
     // Outbound message state map: hex -> state name.
     val outboundState = ConcurrentHashMap<String, String>()
 
+    // Set true at the top of cmdLxmfShutdown so any callbacks the router
+    // schedules during teardown can't repopulate `outboundState` /
+    // `inbox` after we've cleared them. The router's own callbacks may
+    // fire on background threads after `router.stop()` returns.
+    @Volatile var shuttingDown: Boolean = false
+
     // Started TCP interfaces (for shutdown).
     val interfaces = mutableListOf<Any>()
 }
@@ -113,6 +119,31 @@ private fun allocateFreePort(): Int {
 private fun ensureRouter(name: String): LXMRouter =
     BridgeState.router
         ?: throw IllegalStateException("lxmf_init must be called before $name")
+
+/** Terminal outbound states — once observed, never overwrite. */
+private val TERMINAL_OUTBOUND_STATES = setOf("delivered", "failed")
+
+/**
+ * Record an outbound message state without downgrading a terminal one.
+ *
+ * Three writers race on `outboundState[hash]`: the per-message
+ * `deliveryCallback` (any thread the router schedules its callbacks on),
+ * the `failedCallback` (same), and the synchronous post-handleOutbound
+ * write in each `cmdLxmf_send_*`. If a fast OPPORTUNISTIC delivery
+ * completes its callback chain BEFORE the synchronous write reads
+ * `message.state`, the synchronous write would overwrite a terminal
+ * "delivered" with the now-stale "sending". Use compute() to keep
+ * the latest terminal state once we see one.
+ *
+ * Also no-ops once `BridgeState.shuttingDown` is set so late-firing
+ * callbacks don't repopulate the map after `cmdLxmfShutdown` cleared it.
+ */
+private fun recordOutboundState(hashHex: String, newState: String) {
+    if (BridgeState.shuttingDown) return
+    BridgeState.outboundState.compute(hashHex) { _, existing ->
+        if (existing in TERMINAL_OUTBOUND_STATES) existing else newState
+    }
+}
 
 // ----------------------------------------------------------------------
 // LXMF field codec
@@ -189,6 +220,14 @@ private fun encodeFieldValueForInbox(value: Any?): Any? {
     }
 }
 
+// Note on key coercion: LXMF top-level field IDs are Int (0..255),
+// rendered as decimal-string keys on the JSON wire ("5" for
+// FIELD_FILE_ATTACHMENTS, etc.) — that's the spec contract this codec
+// implements. Nested maps with non-string keys (Int, ByteArray) get
+// stringified via k.toString() and DO NOT round-trip back to their
+// original key type on the receive side. None of the LXMF fields the
+// conformance suite exercises today have nested non-string keys, but
+// any future test that uses one will need explicit handling here.
 private fun encodeMessageFields(message: LXMessage): JSONObject {
     val out = JSONObject()
     for ((k, v) in message.fields) {
@@ -237,34 +276,51 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
         shareInstance = false,
     )
 
-    // Fresh identity per bridge process. Matches python reference.
-    val identity = Identity.create()
-    val router = LXMRouter(identity = identity, storagePath = storagePath)
+    // From here on, anything that throws must call Reticulum.stop() so we
+    // don't leak the running RNS instance across bridge restarts. Lxmf_init
+    // is idempotent at the contract level (one bridge process = one router)
+    // but a partial init that left RNS running would prevent subsequent
+    // tests in the same harness from re-establishing.
+    val router: LXMRouter
+    val deliveryDest: Destination
+    val identity: Identity
+    try {
+        // Fresh identity per bridge process. Matches python reference.
+        identity = Identity.create()
+        router = LXMRouter(identity = identity, storagePath = storagePath)
 
-    val deliveryDest = router.registerDeliveryIdentity(identity, displayName = displayName)
+        deliveryDest = router.registerDeliveryIdentity(identity, displayName = displayName)
 
-    router.registerDeliveryCallback { message ->
-        val seq = BridgeState.inboxLock.withLock {
-            BridgeState.inboxSeq += 1
-            BridgeState.inboxSeq
+        router.registerDeliveryCallback { message ->
+            // Drop late callbacks that fire on background threads after
+            // cmdLxmfShutdown cleared the inbox. Otherwise they re-add
+            // the entry and the next test sees stale state.
+            if (BridgeState.shuttingDown) return@registerDeliveryCallback
+            val seq = BridgeState.inboxLock.withLock {
+                BridgeState.inboxSeq += 1
+                BridgeState.inboxSeq
+            }
+            val entry = JSONObject()
+            entry.put("seq", seq)
+            entry.put("message_hash", message.hash?.toHexString() ?: "")
+            entry.put("source_hash", message.sourceHash.toHexString())
+            entry.put("destination_hash", message.destinationHash.toHexString())
+            entry.put("title", message.title)
+            entry.put("content", message.content)
+            entry.put("method", methodToString(message.method))
+            entry.put("ack_status", "received")
+            entry.put("received_at_ms", System.currentTimeMillis())
+            entry.put("fields", encodeMessageFields(message))
+            BridgeState.inboxLock.withLock {
+                BridgeState.inbox.add(entry)
+            }
         }
-        val entry = JSONObject()
-        entry.put("seq", seq)
-        entry.put("message_hash", message.hash?.toHexString() ?: "")
-        entry.put("source_hash", message.sourceHash.toHexString())
-        entry.put("destination_hash", message.destinationHash.toHexString())
-        entry.put("title", message.title)
-        entry.put("content", message.content)
-        entry.put("method", methodToString(message.method))
-        entry.put("ack_status", "received")
-        entry.put("received_at_ms", System.currentTimeMillis())
-        entry.put("fields", encodeMessageFields(message))
-        BridgeState.inboxLock.withLock {
-            BridgeState.inbox.add(entry)
-        }
+
+        router.start()
+    } catch (t: Throwable) {
+        runCatching { Reticulum.stop() }
+        throw t
     }
-
-    router.start()
 
     BridgeState.reticulum = rns
     BridgeState.router = router
@@ -361,16 +417,16 @@ private fun cmdLxmfSendOpportunistic(params: JSONObject): JSONObject {
     )
     // Per-message callbacks so we can track state transitions.
     message.deliveryCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
     message.failedCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
 
     runBlocking { router.handleOutbound(message) }
     val msgHashHex = message.hash?.toHexString() ?: ""
     if (msgHashHex.isNotEmpty()) {
-        BridgeState.outboundState[msgHashHex] = stateToString(message.state)
+        recordOutboundState(msgHashHex, stateToString(message.state))
     }
 
     return JSONObject().put("message_hash", msgHashHex)
@@ -396,16 +452,16 @@ private fun cmdLxmfSendDirect(params: JSONObject): JSONObject {
         desiredMethod = DeliveryMethod.DIRECT,
     )
     message.deliveryCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
     message.failedCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
 
     runBlocking { router.handleOutbound(message) }
     val msgHashHex = message.hash?.toHexString() ?: ""
     if (msgHashHex.isNotEmpty()) {
-        BridgeState.outboundState[msgHashHex] = stateToString(message.state)
+        recordOutboundState(msgHashHex, stateToString(message.state))
     }
 
     return JSONObject().put("message_hash", msgHashHex)
@@ -470,16 +526,16 @@ private fun cmdLxmfSendPropagated(params: JSONObject): JSONObject {
         desiredMethod = DeliveryMethod.PROPAGATED,
     )
     message.deliveryCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
     message.failedCallback = { m ->
-        m.hash?.let { BridgeState.outboundState[it.toHexString()] = stateToString(m.state) }
+        m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
 
     runBlocking { router.handleOutbound(message) }
     val msgHashHex = message.hash?.toHexString() ?: ""
     if (msgHashHex.isNotEmpty()) {
-        BridgeState.outboundState[msgHashHex] = stateToString(message.state)
+        recordOutboundState(msgHashHex, stateToString(message.state))
     }
     return JSONObject().put("message_hash", msgHashHex)
 }
@@ -543,6 +599,11 @@ private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
 }
 
 private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
+    // Set the shuttingDown flag FIRST so any callbacks the router fires
+    // during teardown can't repopulate cleared collections behind us.
+    // The flag is checked by recordOutboundState() and the
+    // registerDeliveryCallback closure.
+    BridgeState.shuttingDown = true
     var stopped = false
     val router = BridgeState.router
     if (router != null) {
