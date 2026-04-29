@@ -406,6 +406,40 @@ private fun cmdLxmfAddTcpServerInterface(params: JSONObject): JSONObject {
         bindAddress = "127.0.0.1",
         bindPort = bindPort,
     )
+
+    // Register each spawned child interface with Transport BEFORE start()
+    // opens the accept loop. The parent TCPServerInterface's processOutgoing
+    // is intentionally a no-op (post-#46) so that Transport routes outbound
+    // packets via the spawned child that owns the actual socket. If the
+    // spawned child isn't registered with Transport, findInterfaceByHash
+    // returns null when an outbound link packet looks up its receiving
+    // interface — and the packet is silently dropped. This manifests as
+    // any DIRECT-from-this-bridge LXMF send appearing to "succeed" (link
+    // handshake completes) while the receiver never sees the data packet.
+    // Mirrors the equivalent wiring in Columba's NativeInterfaceFactory.kt
+    // and reticulum-kt PR #47.
+    iface.onClientConnected = { spawned ->
+        runCatching {
+            Transport.registerInterface(spawned.toRef())
+        }.onFailure { e ->
+            System.err.println(
+                "[bridge] Failed to register spawned client ${spawned.name}: ${e.message}"
+            )
+        }
+    }
+    // Symmetric deregister so a long-running bridge with repeated
+    // connect/disconnect cycles doesn't accumulate stale closed-socket
+    // entries in Transport.interfaces. The upstream
+    // TCPServerInterface.clientDisconnected (rns-interfaces v0.0.15+)
+    // already invokes Transport.deregisterInterface internally on the
+    // child it owns; this hook is a belt-and-suspenders second call to
+    // the same API, idempotent if the child was already removed.
+    iface.onClientDisconnected = { spawned ->
+        runCatching {
+            Transport.deregisterInterface(spawned.toRef())
+        }
+    }
+
     iface.start()
     Transport.registerInterface(iface.toRef())
     BridgeState.interfaces.add(iface)
@@ -766,11 +800,27 @@ fun main() {
     System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn")
     System.setProperty("org.slf4j.simpleLogger.logFile", "System.err")
 
+    // Capture original stdout / stderr by reference. Using these
+    // references for the JSON-RPC channel and for the redirect target
+    // keeps both stable even if a future test framework swaps the
+    // System.out / System.err globals out from under us.
     val out = System.out
+    val err = System.err
     val reader = BufferedReader(InputStreamReader(System.`in`))
 
     out.println("READY")
     out.flush()
+
+    // After READY, hijack System.out and route subsequent stdout writes
+    // to stderr. The JSON-RPC channel uses the captured `out` directly,
+    // so this only redirects unstructured prints. Without this, every
+    // `println(...)` in lxmf-kt / reticulum-kt leaks onto the response
+    // channel and the test harness silently drops it as non-JSON, so
+    // bugs in the underlying stack are completely invisible to anyone
+    // running the conformance suite. We point to the captured `err`
+    // reference so a future System.err swap doesn't redirect us
+    // somewhere unexpected.
+    System.setOut(err)
 
     while (true) {
         val line = try { reader.readLine() } catch (e: Exception) { null }
