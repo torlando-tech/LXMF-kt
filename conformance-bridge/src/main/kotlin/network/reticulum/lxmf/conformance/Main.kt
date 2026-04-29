@@ -1,9 +1,5 @@
 package network.reticulum.lxmf.conformance
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import network.reticulum.Reticulum
 import network.reticulum.common.DestinationDirection
@@ -804,6 +800,9 @@ private fun handleRequest(line: String): JSONObject {
 private fun hexToBytes(hex: String): ByteArray {
     val clean = hex.lowercase()
     require(clean.length % 2 == 0) { "Invalid hex length: ${clean.length}" }
+    require(clean.all { it in '0'..'9' || it in 'a'..'f' }) {
+        "Invalid hex string: contains non-hex characters"
+    }
     val out = ByteArray(clean.length / 2)
     for (i in out.indices) {
         out[i] = ((Character.digit(clean[i * 2], 16) shl 4) or
