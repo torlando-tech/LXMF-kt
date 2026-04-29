@@ -409,14 +409,13 @@ class LXMRouterTest {
     }
 
     @Test
-    fun `test propagated max delivery attempts fires failedCallback`() = runBlocking {
-        // Mirror of the DIRECT test for the parallel PROPAGATED path. The
-        // PR adds failedCallback?.invoke at three sites in
-        // processPropagatedDelivery (no-node, max-attempts early exit,
-        // no-link bump-past-max). With no active propagation node configured,
-        // the no-node path fires immediately — that's the cheapest of the
-        // three to drive without standing up a full PN harness, and it
-        // exercises the same callback-invocation invariant.
+    fun `test propagated delivery without propagation node fires failedCallback`() = runBlocking {
+        // Covers the no-node branch of processPropagatedDelivery
+        // (node == null → state = FAILED). This is one of three new
+        // failedCallback?.invoke sites the PR adds; the other two
+        // (deliveryAttempts > MAX early exit, and the no-link
+        // bump-past-max branch) require a stubbed PN to drive and
+        // are not exercised here. Naming kept narrow to reflect that.
         val destIdentity = Identity.create()
         val sourceDestination = Destination.create(
             identity = identity,
