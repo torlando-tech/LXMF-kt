@@ -187,9 +187,17 @@ class LXMRouterTest {
 
         router.handleOutbound(message)
 
-        // Process should increment delivery attempts
-        router.processOutbound()
-
+        // handleOutbound() also launches an async processOutbound() via
+        // triggerProcessing(); the synchronous call below races it for
+        // outboundProcessingMutex. Poll until at least one attempt has
+        // been recorded — same deflake pattern as the sibling test
+        // "test direct delivery method increments attempts".
+        withTimeout(5_000) {
+            while (message.deliveryAttempts == 0) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
         assertTrue(message.deliveryAttempts > 0)
     }
 
@@ -292,15 +300,21 @@ class LXMRouterTest {
         assertEquals(0, message.deliveryAttempts)
 
         router.handleOutbound(message)
-        router.processOutbound()
+        // handleOutbound() also launches an async processOutbound() via
+        // triggerProcessing(), which races with the synchronous call below
+        // for outboundProcessingMutex.tryLock(). Whichever loses early-
+        // returns without doing work. Pre-PR-#18 the increment was
+        // deterministic on the synchronous path; post-#18 we need to
+        // poll until at least one attempt has been recorded — same
+        // deflake pattern test_max_delivery_attempts uses.
+        withTimeout(5_000) {
+            while (message.deliveryAttempts == 0) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
 
-        // Direct delivery without path/link should increment attempts
-        assertEquals(1, message.deliveryAttempts)
-
-        // Process again
-        router.processOutbound()
-
-        // May retry depending on timing
+        // Direct delivery without path/link should have incremented attempts
         assertTrue(message.deliveryAttempts >= 1)
     }
 

@@ -19,3 +19,4 @@ rootProject.name = "lxmf-kt"
 
 include(":lxmf-core")
 include(":lxmf-examples")
+include(":conformance-bridge")
