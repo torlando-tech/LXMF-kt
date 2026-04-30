@@ -718,6 +718,89 @@ private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
     return JSONObject().put("state", state)
 }
 
+/**
+ * Decode raw LXMF wire bytes and return parsed components + computed hash.
+ *
+ * Byte-level conformance command. Does NOT require lxmf_init — operates
+ * on the LXMessage decoder in isolation. The whole point is to exercise
+ * the msgpack/payload parsing layer directly, against payload shapes
+ * that may be impossible to elicit through normal send commands (e.g.
+ * a fields slot encoded as msgpack Nil, which kotlin's own sender never
+ * emits but iOS LXMF does — and which kotlin's decoder used to throw on,
+ * silently dropping every iOS-originated message).
+ *
+ * Mirrors lxmf_python.py::cmd_lxmf_decode_bytes.
+ *
+ * Implements the same logic shape as LXMessage.unpackFromBytes (the very
+ * code path under test) but without going through Identity recall /
+ * signature validation, so test bytes can use a dummy signature and
+ * unknown destination/source hashes.
+ */
+private fun cmdLxmfDecodeBytes(params: JSONObject): JSONObject {
+    val DEST_LEN = 16
+    val SIG_LEN = 64
+
+    val lxmfBytesHex = params.optString("lxmf_bytes", "")
+    val lxmfBytes = try {
+        hexToBytes(lxmfBytesHex)
+    } catch (e: Exception) {
+        return JSONObject().put("decode_error", "hex parse: ${e::class.simpleName}: ${e.message}")
+    }
+
+    if (lxmfBytes.size < 2 * DEST_LEN + SIG_LEN) {
+        return JSONObject().put("decode_error", "lxmf_bytes too short: ${lxmfBytes.size}")
+    }
+
+    // Call the production decoder directly. This is the WHOLE POINT of the
+    // command — to exercise the actual LXMessage.unpackFromBytes code path
+    // that runs in the wild, not a parallel re-implementation. A bridge
+    // that re-implemented decode here would silently mask production
+    // decoder bugs (e.g. the iOS-Nil-fields landmine that took weeks to
+    // find precisely because the conformance suite couldn't reach the
+    // production code path).
+    val msg = network.reticulum.lxmf.LXMessage.unpackFromBytes(lxmfBytes)
+        ?: return JSONObject().put(
+            "decode_error",
+            "LXMessage.unpackFromBytes returned null — see bridge stderr for the underlying exception"
+        )
+
+    // Detect whether the wire form had Nil fields by re-parsing just that
+    // byte position. This is shape-level — production keeps fields as a
+    // (possibly empty) Map; the wire-side Nil/Map distinction is only
+    // load-bearing through the hash computation which production already
+    // handles. For the test surface, expose it diagnostically.
+    val packedPayload = lxmfBytes.copyOfRange(2 * DEST_LEN + SIG_LEN, lxmfBytes.size)
+    val fieldsWasNil = try {
+        val u = org.msgpack.core.MessagePack.newDefaultUnpacker(packedPayload)
+        u.unpackArrayHeader()
+        u.skipValue() // timestamp
+        u.skipValue() // title
+        u.skipValue() // content
+        val isNil = u.nextFormat.valueType.name == "NIL"
+        u.close()
+        isNil
+    } catch (_: Exception) {
+        false
+    }
+
+    val title = msg.title
+    val content = msg.content
+    val titleHex = title.toByteArray(Charsets.UTF_8).toHexString()
+    val contentHex = content.toByteArray(Charsets.UTF_8).toHexString()
+
+    return JSONObject()
+        .put("destination_hash", msg.destinationHash.toHexString())
+        .put("source_hash", msg.sourceHash.toHexString())
+        .put("signature", (msg.signature ?: ByteArray(0)).toHexString())
+        .put("timestamp", msg.timestamp ?: 0.0)
+        .put("title_hex", titleHex)
+        .put("content_hex", contentHex)
+        .put("fields_was_nil", fieldsWasNil)
+        .put("fields_count", msg.fields.size)
+        .put("stamp", msg.stamp?.toHexString() ?: JSONObject.NULL)
+        .put("message_hash", (msg.hash ?: ByteArray(0)).toHexString())
+}
+
 private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
     // Set the shuttingDown flag FIRST so any callbacks the router fires
     // during teardown can't repopulate cleared collections behind us.
@@ -781,6 +864,7 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_sync_inbound" to ::cmdLxmfSyncInbound,
     "lxmf_get_received_messages" to ::cmdLxmfGetReceivedMessages,
     "lxmf_get_message_state" to ::cmdLxmfGetMessageState,
+    "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
 )
 

@@ -698,8 +698,19 @@ class LXMessage private constructor(
                 val contentBytes = ByteArray(contentLen)
                 unpacker.readPayload(contentBytes)
 
-                // [3] fields
-                val fields = unpackFields(unpacker)
+                // [3] fields — may be msgpack Nil (interop: iOS LXMF and python's
+                // `set_fields(None)` both produce Nil here; python tolerates this on
+                // unpack via LXMessage.py:755 + set_fields() at LXMessage.py:220-224
+                // which accepts None and normalizes to {}). Track wire encoding so
+                // we can repack identically when a stamp is present.
+                val fieldsWasNil = unpacker.nextFormat.valueType.name == "NIL"
+                val fields =
+                    if (fieldsWasNil) {
+                        unpacker.unpackNil()
+                        mutableMapOf()
+                    } else {
+                        unpackFields(unpacker)
+                    }
 
                 // [4] stamp (optional)
                 val stamp: ByteArray? =
@@ -714,8 +725,17 @@ class LXMessage private constructor(
 
                 unpacker.close()
 
-                // Repack payload without stamp for hash verification
-                val payloadWithoutStamp = repackPayload(timestamp, titleBytes, contentBytes, fields)
+                // Mirror python LXMessage.py:742-747: only re-pack to strip the stamp.
+                // For stampless messages use the original packedPayload bytes directly —
+                // any msgpack encoding round-trip risks a hash mismatch (e.g. empty fields
+                // encoded as Nil 0xc0 vs empty Map 0x80). With a stamp present, repack
+                // preserving the original fields encoding (Nil if it was Nil on the wire).
+                val payloadWithoutStamp =
+                    if (stamp == null) {
+                        packedPayload
+                    } else {
+                        repackPayload(timestamp, titleBytes, contentBytes, fields, fieldsWasNil)
+                    }
 
                 // Build hashed part
                 val hashedPart = destinationHash + sourceHash + payloadWithoutStamp
@@ -864,12 +884,21 @@ class LXMessage private constructor(
 
         /**
          * Repack payload without stamp for hash verification.
+         *
+         * [fieldsWasNil] preserves the original wire encoding for the fields
+         * position. If the inbound payload encoded fields as msgpack Nil
+         * (`0xc0`, what iOS LXMF and python's `msgpack.packb(None)` produce),
+         * we must emit Nil here too — emitting an empty Map (`0x80`) instead
+         * would change the byte representation and break the message hash.
+         * Mirrors python `msgpack.packb(unpacked_payload)` round-trip
+         * behavior at LXMessage.py:745, which preserves None as Nil.
          */
         private fun repackPayload(
             timestamp: Double,
             titleBytes: ByteArray,
             contentBytes: ByteArray,
             fields: Map<Int, Any>,
+            fieldsWasNil: Boolean = false,
         ): ByteArray {
             val buffer = ByteArrayOutputStream()
             val packer = MessagePack.newDefaultPacker(buffer)
@@ -888,11 +917,15 @@ class LXMessage private constructor(
             packer.packBinaryHeader(contentBytes.size)
             packer.writePayload(contentBytes)
 
-            // [3] fields
-            packer.packMapHeader(fields.size)
-            for ((key, value) in fields) {
-                packer.packInt(key)
-                repackValue(packer, value)
+            // [3] fields — emit Nil if that's what the wire had, else Map
+            if (fieldsWasNil && fields.isEmpty()) {
+                packer.packNil()
+            } else {
+                packer.packMapHeader(fields.size)
+                for ((key, value) in fields) {
+                    packer.packInt(key)
+                    repackValue(packer, value)
+                }
             }
 
             packer.close()
