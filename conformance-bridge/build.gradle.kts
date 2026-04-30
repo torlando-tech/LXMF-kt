@@ -19,6 +19,11 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
     implementation("org.json:json:20231013")
 
+    // msgpack-core for the byte-level lxmf_decode_bytes command, which
+    // operates directly on the wire format rather than going through
+    // the LXMessage class. Same version as :lxmf-core uses internally.
+    implementation("org.msgpack:msgpack-core:0.9.8")
+
     // Logging — use slf4j-simple but at WARN by default so RNS chatter
     // doesn't interleave with the JSON-RPC stdout protocol.
     implementation("io.github.microutils:kotlin-logging-jvm:3.0.5")

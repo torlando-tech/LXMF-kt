@@ -27,4 +27,11 @@ rootProject.name = "lxmf-kt"
 
 include(":lxmf-core")
 include(":lxmf-examples")
-include(":conformance-bridge")
+// conformance-bridge uses the Shadow plugin which isn't compatible with
+// Gradle 9 consumers via includeBuild. Opt-in only — set
+// INCLUDE_CONFORMANCE_BRIDGE=1 when running the conformance suite.
+// Skipped otherwise so a composite-build override from a Gradle-9
+// consumer (Columba) works for fast iteration.
+if (System.getenv("INCLUDE_CONFORMANCE_BRIDGE") != null) {
+    include(":conformance-bridge")
+}
