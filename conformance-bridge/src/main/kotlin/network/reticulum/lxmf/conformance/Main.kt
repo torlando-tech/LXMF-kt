@@ -540,6 +540,16 @@ private fun cmdLxmfSendCommon(
         m.hash?.let { recordOutboundState(it.toHexString(), stateToString(m.state)) }
     }
 
+    // Optional explicit timestamp for tests that need byte-for-byte
+    // reproducible wire bytes (notably the dedup conformance test, where
+    // two consecutive sends must produce the same message_hash so the
+    // receiver's dedup check actually has something to compare against).
+    // LXMessage.pack() at LXMessage.kt:231-233 only sets timestamp =
+    // currentTimeMillis()/1000 when null, so a pre-set value sticks.
+    if (params.has("timestamp") && !params.isNull("timestamp")) {
+        message.timestamp = params.getDouble("timestamp")
+    }
+
     runBlocking { router.handleOutbound(message) }
     val msgHashHex = message.hash?.toHexString() ?: ""
     if (msgHashHex.isNotEmpty()) {
