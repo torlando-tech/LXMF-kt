@@ -10,6 +10,8 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 
 **Allowed reason 2 — New feature not present in python.** Kotlin-only API surface added for downstream consumers (Android lifecycle adapters, mobile-specific entry points, etc.). The kotlin-only behavior must not change semantics of any code path that *does* exist in python.
 
+**Allowed reason 3 — Deferred python feature.** A python feature that the port has not yet implemented. The port's downstream consumers MUST NOT rely on the missing behavior, and the gap MUST be documented here so that (a) reviewers don't silently re-implement it incorrectly, (b) cross-impl conformance tests covering the missing path know to skip the kotlin axis (`pytest.mark.skipif(impl == "kotlin", reason=...)`), and (c) the gap shows up in any LXMF-kt feature-completeness audit. Removing a category-3 entry is itself the closing PR — the entry stays here only as long as the gap exists.
+
 ## Process
 
 1. Before changing a kotlin port file in a way that diverges from the python reference, read the corresponding python source.
@@ -24,7 +26,7 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 
 **Python reference:** `<path>:<line>` (e.g. `LXMF/LXMRouter.py:2554-2580`)
 
-**Category:** language/runtime forced  |  new feature
+**Category:** language/runtime forced  |  new feature  |  deferred python feature
 
 **Date:** YYYY-MM-DD
 
@@ -39,4 +41,31 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 
 ## Deviations
 
-*(none yet — this file is new. As deviations are introduced or discovered, add them here.)*
+### Propagation node peering stamp generation — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMPeer.kt`
+
+**Python reference:** `LXMF/LXMF/LXMPeer.py:259` — `LXStamper.generate_stamp(key_material, self.peering_cost, expand_rounds=LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING)`. Constants at `LXMF/LXMF/LXStamper.py:12` (`WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`) and used throughout `LXStamper.py:59,402` for peering-cost validation.
+
+**Category:** deferred python feature
+
+**Date:** 2026-04-30
+
+**Tracking:** https://github.com/torlando-tech/LXMF-kt/issues/26
+
+**Description:**
+Python's `LXMPeer` generates a per-peering stamp (`peering_key`) during the peering handshake using `WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`. The stamp is required by upstream propagation nodes that enforce peering-cost validation.
+
+The kotlin port:
+- Defines the cost constants (`LXMFConstants.kt:280` `PEERING_COST = 18`, `MAX_PEERING_COST = 26`)
+- Threads `peeringCost` through `LXMRouter` (`LXMRouter.kt:330,1936`)
+- **Does not** define `WORKBLOCK_EXPAND_ROUNDS_PEERING` in `LXStamper.kt` (kotlin only has `WORKBLOCK_EXPAND_ROUNDS = 3000` and `WORKBLOCK_EXPAND_ROUNDS_PN = 1000`)
+- **Does not** implement peering stamp generation or validation in `LXMPeer.kt`
+
+**Consequence:** A kotlin-hosted propagation node cannot peer with python PNs that require peering-cost validation, and a kotlin client peering with a python PN cannot generate the expected `peering_key`. In current Columba deployments this gap doesn't bite end users — Columba runs as a leaf client using python-hosted PNs for propagation, never as a PN itself. It would block kotlin from ever serving as a PN to python clients.
+
+**Conformance impact:** Any cross-impl test that exercises peering-stamp generation/validation (planned: `tests/test_peering.py` in lxmf-conformance) MUST skip the kotlin axis until this is implemented (`@pytest.mark.skipif(impl == "kotlin", reason="LXMF-kt does not implement peering stamps yet — see port-deviations.md")`).
+
+**Re-evaluation:** Implement when (a) a downstream consumer wants to host a kotlin-side PN that python clients peer with, OR (b) upstream LXMF makes peering-cost validation mandatory at all peering relationships. Recipe:
+1. Add `WORKBLOCK_EXPAND_ROUNDS_PEERING = 25` to `LXStamper.kt`
+2. Add `generateStamp(material, cost, expandRounds)` overload accepting custom expand rounds (mirror python `LXStamper.py:59`)
+3. Wire into `LXMPeer.kt` peering handshake mirroring `LXMPeer.py:259`
+4. Remove this entry; the closing PR lands the conformance test as well
