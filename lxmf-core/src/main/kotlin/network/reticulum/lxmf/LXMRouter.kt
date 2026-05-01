@@ -164,8 +164,17 @@ class LXMRouter(
 
     // ===== Callbacks =====
 
-    /** Callback for delivered messages */
-    private var deliveryCallback: ((LXMessage) -> Unit)? = null
+    /**
+     * Callback for delivered inbound messages.
+     *
+     * Receives an [LXMessageDelivery] (sealed `Verified | Unverified`)
+     * rather than a raw [LXMessage] so consumers cannot accidentally
+     * treat unverified messages as authentic. Kotlin's exhaustive `when`
+     * forces the consumer to make an explicit policy decision for the
+     * Unverified branch. See [LXMessageDelivery] KDoc for threat-model
+     * context and the SIGNATURE_INVALID-vs-SOURCE_UNKNOWN distinction.
+     */
+    private var deliveryCallback: ((LXMessageDelivery) -> Unit)? = null
 
     /** Callback for message delivery failures */
     private var failedDeliveryCallback: ((LXMessage) -> Unit)? = null
@@ -432,14 +441,31 @@ class LXMRouter(
     }
 
     /**
-     * Register a callback for delivered messages.
+     * Register a callback for delivered inbound messages.
      *
-     * The callback will be invoked when a message is successfully received
-     * and validated.
+     * The callback receives an [LXMessageDelivery] sealed type rather than
+     * a raw [LXMessage]. Consumers MUST exhaustively handle both
+     * [LXMessageDelivery.Verified] (signature checked, source identity
+     * known and matched) and [LXMessageDelivery.Unverified] (source
+     * identity not yet observed on this peer's RNS — treat with
+     * suspicion, e.g. show a "this sender's identity has not been
+     * verified" warning in your UI).
      *
-     * @param callback Function to call with delivered messages
+     * The router has already filtered [UnverifiedReason.SIGNATURE_INVALID]
+     * (the "tampered message claiming to be from a known sender" case)
+     * before invoking this callback — those never reach consumers.
+     * See [LXMessageDelivery] KDoc for full threat model.
+     *
+     * Port deviation from python: python's `register_delivery_callback`
+     * (LXMRouter.py:356) takes a `(LXMessage) -> Unit`; the kotlin port
+     * uses a sealed type so the kotlin compiler can prevent the
+     * silent-accept-unverified mistake at compile time. Documented in
+     * `port-deviations.md`.
+     *
+     * @param callback Function called with each delivered message wrapped
+     *   in an [LXMessageDelivery] sum type.
      */
-    fun registerDeliveryCallback(callback: (LXMessage) -> Unit) {
+    fun registerDeliveryCallback(callback: (LXMessageDelivery) -> Unit) {
         deliveryCallback = callback
     }
 
@@ -1651,8 +1677,32 @@ class LXMRouter(
                 // threads data in via a non-standard path; leave fields null.
             }
 
-            // Invoke delivery callback
-            deliveryCallback?.invoke(message)
+            // Wrap the message in the sealed LXMessageDelivery type before
+            // invoking the consumer callback. SIGNATURE_INVALID was already
+            // dropped at the signature-validation block earlier in this
+            // method (search for `unverifiedReason` above) — by the time
+            // execution reaches here, message.unverifiedReason is either
+            // null (signatureValidated=true) or SOURCE_UNKNOWN. The
+            // !signatureValidated branch defensively defaults to
+            // SOURCE_UNKNOWN if unverifiedReason is somehow null, since
+            // that's the only legitimate state reachable here.
+            //
+            // Two coupled port-deviations from python (both in
+            // port-deviations.md, category "safety-strict default"):
+            // 1) The SIGNATURE_INVALID drop above (python delivers these).
+            // 2) The sealed-type wrapping here (python passes a raw
+            //    LXMessage). Together they close the signature-forgery
+            //    class for any LXMF-kt consumer regardless of whether
+            //    the consumer remembers to check signatureValidated.
+            val delivery = if (message.signatureValidated) {
+                LXMessageDelivery.Verified(message)
+            } else {
+                LXMessageDelivery.Unverified(
+                    message = message,
+                    reason = message.unverifiedReason ?: UnverifiedReason.SOURCE_UNKNOWN,
+                )
+            }
+            deliveryCallback?.invoke(delivery)
         } catch (e: Exception) {
             println("Error processing inbound delivery: ${e.message}")
         }

@@ -66,8 +66,8 @@ class LXMRouterTest {
     fun `test register delivery callback`() {
         var receivedMessage: LXMessage? = null
 
-        router.registerDeliveryCallback { message ->
-            receivedMessage = message
+        router.registerDeliveryCallback { delivery ->
+            receivedMessage = delivery.message
         }
 
         // Callback is registered (we can't easily test it fires without full transport)
@@ -620,7 +620,22 @@ class LXMRouterTest {
     @Test
     fun `opportunistic delivery annotates LXMessage with packet phy metadata`() {
         val received = CopyOnWriteArrayList<LXMessage>()
-        router.registerDeliveryCallback { received.add(it) }
+        // Tests assert on the LXMessage payload, not the verification
+        // wrapper; unwrap the sealed delivery type. Production code MUST
+        // exhaustively handle both Verified and Unverified — these tests
+        // only exercise the Verified path because they construct messages
+        // signed by known identities (no Unverified state reachable here).
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> received.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery in a test that should only " +
+                        "produce verified messages — sender's identity should have been " +
+                        "registered with receiver's RNS via Identity.remember(). " +
+                        "Reason: ${delivery.reason}, source: ${delivery.message.sourceHash.toHexString()}"
+                )
+            }
+        }
 
         val destinationIdentity = Identity.create()
         val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "MetaNode")
@@ -685,7 +700,22 @@ class LXMRouterTest {
         // path under test — the null-on-propagated branch in the
         // annotation block — is exercised exactly as in prod.
         val received = CopyOnWriteArrayList<LXMessage>()
-        router.registerDeliveryCallback { received.add(it) }
+        // Tests assert on the LXMessage payload, not the verification
+        // wrapper; unwrap the sealed delivery type. Production code MUST
+        // exhaustively handle both Verified and Unverified — these tests
+        // only exercise the Verified path because they construct messages
+        // signed by known identities (no Unverified state reachable here).
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> received.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery in a test that should only " +
+                        "produce verified messages — sender's identity should have been " +
+                        "registered with receiver's RNS via Identity.remember(). " +
+                        "Reason: ${delivery.reason}, source: ${delivery.message.sourceHash.toHexString()}"
+                )
+            }
+        }
 
         // Set up a delivery destination whose identity we control so we
         // can also build an OUT-direction destination that encrypts for it.
@@ -773,7 +803,22 @@ class LXMRouterTest {
         // test exercises link.getRssi/getSnr/attachedInterfaceHash/
         // expectedHops as production does.
         val received = CopyOnWriteArrayList<LXMessage>()
-        router.registerDeliveryCallback { received.add(it) }
+        // Tests assert on the LXMessage payload, not the verification
+        // wrapper; unwrap the sealed delivery type. Production code MUST
+        // exhaustively handle both Verified and Unverified — these tests
+        // only exercise the Verified path because they construct messages
+        // signed by known identities (no Unverified state reachable here).
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> received.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery in a test that should only " +
+                        "produce verified messages — sender's identity should have been " +
+                        "registered with receiver's RNS via Identity.remember(). " +
+                        "Reason: ${delivery.reason}, source: ${delivery.message.sourceHash.toHexString()}"
+                )
+            }
+        }
 
         val destinationIdentity = Identity.create()
         router.registerDeliveryIdentity(destinationIdentity, "ResourceNode")
@@ -854,7 +899,22 @@ class LXMRouterTest {
         // layer reuses a buffer for receivingInterfaceHash, mutations must
         // not reach the LXMessage after delivery.
         val received = CopyOnWriteArrayList<LXMessage>()
-        router.registerDeliveryCallback { received.add(it) }
+        // Tests assert on the LXMessage payload, not the verification
+        // wrapper; unwrap the sealed delivery type. Production code MUST
+        // exhaustively handle both Verified and Unverified — these tests
+        // only exercise the Verified path because they construct messages
+        // signed by known identities (no Unverified state reachable here).
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> received.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery in a test that should only " +
+                        "produce verified messages — sender's identity should have been " +
+                        "registered with receiver's RNS via Identity.remember(). " +
+                        "Reason: ${delivery.reason}, source: ${delivery.message.sourceHash.toHexString()}"
+                )
+            }
+        }
 
         val destinationIdentity = Identity.create()
         val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "DefensiveCopyNode")
@@ -891,7 +951,22 @@ class LXMRouterTest {
         // NULL metadata on the LXMessage — not garbage / zeros. This pins
         // the "null-or-meaningful" invariant downstream consumers rely on.
         val received = CopyOnWriteArrayList<LXMessage>()
-        router.registerDeliveryCallback { received.add(it) }
+        // Tests assert on the LXMessage payload, not the verification
+        // wrapper; unwrap the sealed delivery type. Production code MUST
+        // exhaustively handle both Verified and Unverified — these tests
+        // only exercise the Verified path because they construct messages
+        // signed by known identities (no Unverified state reachable here).
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> received.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery in a test that should only " +
+                        "produce verified messages — sender's identity should have been " +
+                        "registered with receiver's RNS via Identity.remember(). " +
+                        "Reason: ${delivery.reason}, source: ${delivery.message.sourceHash.toHexString()}"
+                )
+            }
+        }
 
         val destinationIdentity = Identity.create()
         val deliveryDest = router.registerDeliveryIdentity(destinationIdentity, "MetaNodeNull")
