@@ -10,6 +10,7 @@ import network.reticulum.interop.getString
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.MessageState
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
@@ -31,10 +32,27 @@ class LiveDeliveryTest : DirectDeliveryTestBase() {
     private val receivedMessages = CopyOnWriteArrayList<LXMessage>()
 
     private fun registerDeliveryCallback() {
-        // Register delivery callback for Python -> Kotlin messages
-        kotlinRouter.registerDeliveryCallback { message ->
-            println("[KT] Received message: ${message.title} - ${message.content}")
-            receivedMessages.add(message)
+        // Register delivery callback for Python -> Kotlin messages.
+        // The python sender's identity is shared with this kotlin receiver
+        // via the Identity.remember setup in DirectDeliveryTestBase, so
+        // every delivery here should arrive Verified. An Unverified
+        // delivery in this fixture is a test setup bug, not a production
+        // signature failure — fail loudly so the misconfiguration is
+        // visible rather than silently degrading the assertion target.
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> {
+                    val message = delivery.message
+                    println("[KT] Received message: ${message.title} - ${message.content}")
+                    receivedMessages.add(message)
+                }
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery from python in DirectDelivery " +
+                        "fixture — python sender's identity should have been registered " +
+                        "with the kotlin receiver via Identity.remember(). " +
+                        "Reason: ${delivery.reason}"
+                )
+            }
         }
     }
 

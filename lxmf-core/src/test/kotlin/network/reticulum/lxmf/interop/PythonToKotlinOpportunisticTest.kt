@@ -8,6 +8,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import network.reticulum.interop.getString
 import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.util.concurrent.CopyOnWriteArrayList
@@ -30,9 +31,18 @@ class PythonToKotlinOpportunisticTest : OpportunisticDeliveryTestBase() {
         receivedMessages.clear()
 
         // Set up Kotlin to receive messages
-        kotlinRouter.registerDeliveryCallback { message ->
-            println("[Test] Kotlin received message: ${message.content}")
-            receivedMessages.add(message)
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> {
+                    val message = delivery.message
+                    println("[Test] Kotlin received message: ${message.content}")
+                    receivedMessages.add(message)
+                }
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery — sender's identity should " +
+                        "have been registered with kotlin receiver. Reason: ${delivery.reason}"
+                )
+            }
         }
 
         // Step 1: Kotlin announces so Python knows the path and can recall identity
@@ -84,8 +94,13 @@ class PythonToKotlinOpportunisticTest : OpportunisticDeliveryTestBase() {
     fun `Python opportunistic message with fields preserved`() = runBlocking {
         receivedMessages.clear()
 
-        kotlinRouter.registerDeliveryCallback { message ->
-            receivedMessages.add(message)
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> receivedMessages.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery. Reason: ${delivery.reason}"
+                )
+            }
         }
 
         // Kotlin announces
@@ -134,8 +149,13 @@ class PythonToKotlinOpportunisticTest : OpportunisticDeliveryTestBase() {
     fun `Python opportunistic message title preserved`() = runBlocking {
         receivedMessages.clear()
 
-        kotlinRouter.registerDeliveryCallback { message ->
-            receivedMessages.add(message)
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> receivedMessages.add(delivery.message)
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery. Reason: ${delivery.reason}"
+                )
+            }
         }
 
         // Kotlin announces

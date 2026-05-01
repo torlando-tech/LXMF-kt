@@ -5,6 +5,7 @@ import network.reticulum.common.toHexString
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMRouter.PropagationTransferState
 import network.reticulum.transport.Transport
@@ -101,12 +102,19 @@ class PropagationSyncTest {
         println("Registered delivery destination: ${deliveryDest.hash.toHexString()}")
 
         // Register message callback
-        router.registerDeliveryCallback { message ->
+        router.registerDeliveryCallback { delivery ->
+            // Unwrap the sealed delivery type. Test instrumentation
+            // tracks valid-vs-invalid counts separately so the test
+            // can assert on signature validation behavior end-to-end.
+            val message = delivery.message
+            val isValidated = delivery is LXMessageDelivery.Verified
+            val unverifiedReasonText = (delivery as? LXMessageDelivery.Unverified)?.reason?.toString()
+
             messagesReceived++
             val msgSenderHash = message.sourceHash?.toHexString() ?: "unknown"
             if (senderHash == null) senderHash = msgSenderHash
 
-            if (message.signatureValidated) {
+            if (isValidated) {
                 signaturesValid.incrementAndGet()
             } else {
                 signaturesInvalid.incrementAndGet()
@@ -118,9 +126,9 @@ class PropagationSyncTest {
             println("From: $msgSenderHash")
             println("Title: ${message.title}")
             println("Content: ${message.content}")
-            println("Signature valid: ${message.signatureValidated}")
-            if (!message.signatureValidated) {
-                println("Unverified reason: ${message.unverifiedReason}")
+            println("Signature valid: $isValidated")
+            if (unverifiedReasonText != null) {
+                println("Unverified reason: $unverifiedReasonText")
             }
             println("${"=".repeat(50)}\n")
         }
