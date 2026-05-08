@@ -80,7 +80,7 @@ The kotlin port:
 
 **Date:** 2026-04-30
 
-**Tracking:** signature-forgery POC at `/tmp/lxmf_signature_forgery_poc.py` (local — not checked in); reproduces against unmodified python LXMF and confirms the library delivers a forged message with `signature_validated = False` to the consumer callback.
+**Tracking:** signature-forgery technique reproduced against unmodified python LXMF. Procedure: (a) read the recipient's announce off the network — this exposes the recipient identity public key + destination hash; (b) construct an `LXMessage` addressed to the recipient with an attacker-chosen `source_hash` referencing some other known identity; (c) encrypt the packet to the recipient's public key (the recipient's identity public key is by-design public, distributed via announces); (d) sign with the attacker's own private key, not the impersonated source's; (e) deliver via standard RNS transport. The recipient decodes the packet, sets `message.signature_validated = False` and `message.unverified_reason = SIGNATURE_INVALID` (because the `source_hash` matches a known identity but the signature did not validate against that identity's public key), and python LXMF unconditionally calls `__delivery_callback(message)` regardless (LXMRouter.py:1787-1792). A consumer that does not filter on `signature_validated` then renders the forged message as authentic. The kotlin port closes this at the library layer by dropping `SIGNATURE_INVALID` before the callback is invoked.
 
 **Description:**
 The kotlin port adds an explicit drop at `processInboundDelivery` for `UnverifiedReason.SIGNATURE_INVALID`:

@@ -102,5 +102,21 @@ public sealed class LXMessageDelivery {
     public data class Unverified(
         override val message: LXMessage,
         public val reason: UnverifiedReason,
-    ) : LXMessageDelivery()
+    ) : LXMessageDelivery() {
+        init {
+            // Make the documented invariant structural rather than just
+            // KDoc convention. The router unconditionally drops
+            // SIGNATURE_INVALID at processInboundDelivery before this
+            // wrapper is constructed, so any code path that reaches
+            // this constructor with SIGNATURE_INVALID is a bug — most
+            // likely a misuse of the API by a test or a hand-rolled
+            // delivery path that didn't replicate the router's
+            // signature-check policy. Failing fast at construction
+            // surfaces that bug at the call site instead of letting
+            // it silently propagate to consumer code.
+            require(reason != UnverifiedReason.SIGNATURE_INVALID) {
+                "SIGNATURE_INVALID is dropped at the router layer and must not be wrapped in Unverified"
+            }
+        }
+    }
 }

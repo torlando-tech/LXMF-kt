@@ -6,6 +6,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
@@ -72,6 +73,12 @@ class LXMessageDeliveryTest {
         // updating callers, the consumer's `when` becomes a compile error
         // — that's the entire point of using a sealed type for this
         // security-sensitive API.
+        //
+        // Only SOURCE_UNKNOWN is exercised in the Unverified branch:
+        // SIGNATURE_INVALID is rejected at construction by the
+        // Unverified `init` guard (separate test below) since the router
+        // drops it before wrapping. Constructing it here would only
+        // normalise a state the API contract says is impossible.
         val branches = mutableListOf<String>()
 
         fun route(delivery: LXMessageDelivery) {
@@ -83,12 +90,29 @@ class LXMessageDeliveryTest {
 
         route(LXMessageDelivery.Verified(makeMessage()))
         route(LXMessageDelivery.Unverified(makeMessage(), UnverifiedReason.SOURCE_UNKNOWN))
-        route(LXMessageDelivery.Unverified(makeMessage(), UnverifiedReason.SIGNATURE_INVALID))
 
         assertEquals(
-            listOf("verified", "unverified:SOURCE_UNKNOWN", "unverified:SIGNATURE_INVALID"),
+            listOf("verified", "unverified:SOURCE_UNKNOWN"),
             branches,
-            "All three deliveries must dispatch through their correct sealed-type branches in order",
+            "Both deliveries must dispatch through their correct sealed-type branches in order",
+        )
+    }
+
+    @Test
+    fun `Unverified rejects SIGNATURE_INVALID at construction`() {
+        // The Unverified.init guard makes the documented invariant
+        // structural: SIGNATURE_INVALID is dropped at the router layer
+        // (LXMRouter.processInboundDelivery) and must never be wrapped
+        // in an Unverified delivery. This test is the type-system
+        // counterpart to the router-layer drop tested in LXMRouterTest
+        // — together they enforce the invariant at both ends of the
+        // delivery pipeline.
+        val ex = assertFailsWith<IllegalArgumentException> {
+            LXMessageDelivery.Unverified(makeMessage(), UnverifiedReason.SIGNATURE_INVALID)
+        }
+        assertTrue(
+            ex.message?.contains("SIGNATURE_INVALID") == true,
+            "Failure message must reference SIGNATURE_INVALID for diagnosability; got: ${ex.message}",
         )
     }
 
