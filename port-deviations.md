@@ -4,7 +4,7 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 
 ## Rule
 
-> All logic in LXMF-kt MUST mirror the python reference identically. Deviations are allowed ONLY for one of two reasons, both of which MUST be documented here before the code lands.
+> All logic in LXMF-kt MUST mirror the python reference identically. Deviations are allowed ONLY for one of three reasons, all of which MUST be documented here before the code lands.
 
 **Allowed reason 1 — Language/runtime forced.** The python pattern cannot be expressed faithfully in kotlin or on the JVM. Examples: coroutines vs threads, `@Volatile` vs the GIL, `ReentrantLock` where python relies on GIL-implicit serialization, `kotlinx.coroutines.runBlocking` boundaries at JVM/non-coroutine seams.
 
@@ -15,7 +15,7 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 ## Process
 
 1. Before changing a kotlin port file in a way that diverges from the python reference, read the corresponding python source.
-2. If the divergence is unavoidable for one of the two reasons above, add a section below using the template, then implement the change.
+2. If the divergence is unavoidable for one of the three reasons above, add a section below using the template, then implement the change.
 3. If you're unsure whether a divergence is justified, ask the human owner before picking unilaterally. Ports drift one small "harmless" choice at a time.
 4. Reviewers should reject any PR that introduces a kotlin/python semantics divergence not represented in this file.
 
@@ -34,7 +34,7 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 
 **Description:** what the kotlin code does, why it differs from python, and (for category 1) why no kotlin idiom can express the python semantics directly.
 
-**Re-evaluation:** if a future kotlin/JVM/library change would make the python pattern expressible, what to look for.
+**Re-evaluation:** for category 1 — if a future kotlin/JVM/library change would make the python pattern expressible, what to look for. For category 3 — the trigger condition(s) that should prompt implementation.
 ```
 
 ---
