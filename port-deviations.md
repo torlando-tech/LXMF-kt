@@ -15,7 +15,7 @@ This file is the **single source of truth** for every place where LXMF-kt's logi
 ## Process
 
 1. Before changing a kotlin port file in a way that diverges from the python reference, read the corresponding python source.
-2. If the divergence is unavoidable for one of the three reasons above, add a section below using the template, then implement the change.
+2. If the divergence is unavoidable for one of the three reasons above, add a section below using the template. For categories 1 and 2, then implement the change. For category 3, open a tracking issue and STOP — do not implement; the gap is documented precisely because it isn't being closed in this PR.
 3. If you're unsure whether a divergence is justified, ask the human owner before picking unilaterally. Ports drift one small "harmless" choice at a time.
 4. Reviewers should reject any PR that introduces a kotlin/python semantics divergence not represented in this file.
 
