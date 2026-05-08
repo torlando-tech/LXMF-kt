@@ -786,7 +786,7 @@ private fun cmdLxmfDecodeBytes(params: JSONObject): JSONObject {
         u.skipValue() // timestamp
         u.skipValue() // title
         u.skipValue() // content
-        val isNil = u.nextFormat.valueType.name == "NIL"
+        val isNil = u.tryUnpackNil()
         u.close()
         isNil
     } catch (_: Exception) {

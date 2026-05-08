@@ -703,10 +703,11 @@ class LXMessage private constructor(
                 // unpack via LXMessage.py:755 + set_fields() at LXMessage.py:220-224
                 // which accepts None and normalizes to {}). Track wire encoding so
                 // we can repack identically when a stamp is present.
-                val fieldsWasNil = unpacker.nextFormat.valueType.name == "NIL"
+                // tryUnpackNil() peek-and-consumes in one call; if it returns true the
+                // Nil byte is already consumed so no follow-up unpackNil() is needed.
+                val fieldsWasNil = unpacker.tryUnpackNil()
                 val fields =
                     if (fieldsWasNil) {
-                        unpacker.unpackNil()
                         mutableMapOf()
                     } else {
                         unpackFields(unpacker)
