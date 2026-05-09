@@ -2118,6 +2118,13 @@ class LXMRouter(
         println("[LXMRouter] requestMessages: link=${link != null}, status=${link?.status}, node=${node.hexHash.take(12)}")
         if (link != null && link.status == LinkConstants.ACTIVE) {
             propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
+            // Mirror python LXMRouter.py:494 — identify on the link before
+            // requesting messages, even when reusing an existing one. The
+            // delivery path establishes a link without identifying, so a
+            // reused link won't be associated with our peer identity until
+            // we call identify here. Skipping this caused lxmd to return
+            // ERROR_NO_IDENTITY (240) on /get requests.
+            identifyOnLink(link)
             requestMessageList(link)
         } else {
             // Need to establish link first
