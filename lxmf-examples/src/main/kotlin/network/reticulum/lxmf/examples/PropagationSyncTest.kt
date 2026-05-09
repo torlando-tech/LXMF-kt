@@ -103,22 +103,23 @@ class PropagationSyncTest {
 
         // Register message callback
         router.registerDeliveryCallback { delivery ->
-            // Unwrap the sealed delivery type. Test instrumentation
-            // tracks valid-vs-invalid counts separately so the test
-            // can assert on signature validation behavior end-to-end.
+            // Unwrap the sealed delivery type via an exhaustive `when`
+            // so a future third subtype of LXMessageDelivery becomes a
+            // compile error here rather than silently misclassifying as
+            // signaturesInvalid — which is the exact silent-accept bug
+            // the sealed type is designed to prevent.
             val message = delivery.message
-            val isValidated = delivery is LXMessageDelivery.Verified
-            val unverifiedReasonText = (delivery as? LXMessageDelivery.Unverified)?.reason?.toString()
-
-            messagesReceived++
             val msgSenderHash = message.sourceHash?.toHexString() ?: "unknown"
             if (senderHash == null) senderHash = msgSenderHash
+            messagesReceived++
 
-            if (isValidated) {
-                signaturesValid.incrementAndGet()
-            } else {
-                signaturesInvalid.incrementAndGet()
+            when (delivery) {
+                is LXMessageDelivery.Verified -> signaturesValid.incrementAndGet()
+                is LXMessageDelivery.Unverified -> signaturesInvalid.incrementAndGet()
             }
+
+            val isValidated = delivery is LXMessageDelivery.Verified
+            val unverifiedReasonText = (delivery as? LXMessageDelivery.Unverified)?.reason?.toString()
 
             println("\n${"=".repeat(50)}")
             println("MESSAGE RECEIVED (#$messagesReceived)")
