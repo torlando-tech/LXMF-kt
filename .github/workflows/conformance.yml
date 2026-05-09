@@ -106,6 +106,12 @@ jobs:
         # The bridge JAR ends up at conformance-bridge/build/libs/
         # LXMFConformanceBridge.jar — same path the conformance repo's
         # default detection looks at via CONFORMANCE_KOTLIN_BRIDGE_CMD.
+        # settings.gradle.kts gates :conformance-bridge behind this env var
+        # so Gradle 9 consumers (Columba) using composite-build override
+        # don't pick up the Shadow plugin transitively. Set it here so the
+        # bridge project actually exists when this workflow asks for it.
+        env:
+          INCLUDE_CONFORMANCE_BRIDGE: "1"
         run: ./gradlew :conformance-bridge:shadowJar --stacktrace
 
       - name: Run conformance suite (python ↔ kotlin)
