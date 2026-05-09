@@ -5,6 +5,7 @@ import network.reticulum.common.toHexString
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMRouter.PropagationTransferState
 import network.reticulum.transport.Transport
@@ -101,16 +102,24 @@ class PropagationSyncTest {
         println("Registered delivery destination: ${deliveryDest.hash.toHexString()}")
 
         // Register message callback
-        router.registerDeliveryCallback { message ->
-            messagesReceived++
+        router.registerDeliveryCallback { delivery ->
+            // Unwrap the sealed delivery type via an exhaustive `when`
+            // so a future third subtype of LXMessageDelivery becomes a
+            // compile error here rather than silently misclassifying as
+            // signaturesInvalid — which is the exact silent-accept bug
+            // the sealed type is designed to prevent.
+            val message = delivery.message
             val msgSenderHash = message.sourceHash?.toHexString() ?: "unknown"
             if (senderHash == null) senderHash = msgSenderHash
+            messagesReceived++
 
-            if (message.signatureValidated) {
-                signaturesValid.incrementAndGet()
-            } else {
-                signaturesInvalid.incrementAndGet()
+            when (delivery) {
+                is LXMessageDelivery.Verified -> signaturesValid.incrementAndGet()
+                is LXMessageDelivery.Unverified -> signaturesInvalid.incrementAndGet()
             }
+
+            val isValidated = delivery is LXMessageDelivery.Verified
+            val unverifiedReasonText = (delivery as? LXMessageDelivery.Unverified)?.reason?.toString()
 
             println("\n${"=".repeat(50)}")
             println("MESSAGE RECEIVED (#$messagesReceived)")
@@ -118,9 +127,9 @@ class PropagationSyncTest {
             println("From: $msgSenderHash")
             println("Title: ${message.title}")
             println("Content: ${message.content}")
-            println("Signature valid: ${message.signatureValidated}")
-            if (!message.signatureValidated) {
-                println("Unverified reason: ${message.unverifiedReason}")
+            println("Signature valid: $isValidated")
+            if (unverifiedReasonText != null) {
+                println("Unverified reason: $unverifiedReasonText")
             }
             println("${"=".repeat(50)}\n")
         }

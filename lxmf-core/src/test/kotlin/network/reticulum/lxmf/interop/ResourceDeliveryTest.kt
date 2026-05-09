@@ -10,6 +10,7 @@ import network.reticulum.interop.getString
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.MessageRepresentation
 import network.reticulum.lxmf.MessageState
 import org.junit.jupiter.api.MethodOrderer
@@ -44,9 +45,18 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
     private val receivedMessages = CopyOnWriteArrayList<LXMessage>()
 
     private fun registerDeliveryCallback() {
-        kotlinRouter.registerDeliveryCallback { message ->
-            println("[KT] Received message: ${message.title} - ${message.content.take(50)}...")
-            receivedMessages.add(message)
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> {
+                    val message = delivery.message
+                    println("[KT] Received message: ${message.title} - ${message.content.take(50)}...")
+                    receivedMessages.add(message)
+                }
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery from python sender. " +
+                        "Reason: ${delivery.reason}"
+                )
+            }
         }
     }
 

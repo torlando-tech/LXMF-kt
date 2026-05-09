@@ -12,6 +12,7 @@ import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.transport.Transport
 import java.time.Instant
@@ -120,8 +121,20 @@ class LxmfEchoBot {
         myDestination = router.registerDeliveryIdentity(identity, DISPLAY_NAME)
 
         // Register callback for incoming messages
-        router.registerDeliveryCallback { message ->
-            handleIncomingMessage(message)
+        router.registerDeliveryCallback { delivery ->
+            // Echo bot policy: only echo verified messages. Echoing
+            // unverified messages would let an unverified peer trigger
+            // outbound traffic by claiming to be from a known sender,
+            // which has DDoS-amplification potential.
+            when (delivery) {
+                is LXMessageDelivery.Verified -> handleIncomingMessage(delivery.message)
+                is LXMessageDelivery.Unverified -> {
+                    System.err.println(
+                        "[WARN] Dropping unverified message from " +
+                            "${delivery.message.sourceHash.toHexString()}: ${delivery.reason}"
+                    )
+                }
+            }
         }
 
         // Start the router's background processing

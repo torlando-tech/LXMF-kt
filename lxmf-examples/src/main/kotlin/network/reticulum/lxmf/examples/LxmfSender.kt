@@ -11,6 +11,7 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.transport.Transport
 import java.time.Instant
@@ -128,8 +129,25 @@ class LxmfSender(
         myDestination = router.registerDeliveryIdentity(identity, DISPLAY_NAME)
 
         // Register for incoming messages (echo replies)
-        router.registerDeliveryCallback { message ->
-            handleIncomingMessage(message)
+        router.registerDeliveryCallback { delivery ->
+            // Realistic example policy mirroring Sideband's UI behavior:
+            // ingest both verified and unverified messages, but log a
+            // warning for unverified ones so a downstream UI can render
+            // a "this sender is unverified" badge. Replace with strict
+            // drop in production if you don't want unverified messages
+            // visible at all.
+            when (delivery) {
+                is LXMessageDelivery.Verified ->
+                    handleIncomingMessage(delivery.message)
+                is LXMessageDelivery.Unverified -> {
+                    System.err.println(
+                        "[WARN] Unverified message from " +
+                            "${delivery.message.sourceHash.toHexString()}: " +
+                            "${delivery.reason} — treat with caution"
+                    )
+                    handleIncomingMessage(delivery.message)
+                }
+            }
         }
 
         router.start()
