@@ -7,6 +7,7 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.toRef
 import network.reticulum.interfaces.udp.UDPInterface
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.transport.Transport
 import java.time.Instant
@@ -134,8 +135,19 @@ class LxmfNode(
         val destination = router.registerDeliveryIdentity(identity, displayName)
 
         // Register callback for incoming messages
-        router.registerDeliveryCallback { message ->
-            handleIncomingMessage(message)
+        router.registerDeliveryCallback { delivery ->
+            // Demo policy: ingest both, distinguish in the log line.
+            // Production consumers should pick a stricter policy.
+            when (delivery) {
+                is LXMessageDelivery.Verified -> handleIncomingMessage(delivery.message)
+                is LXMessageDelivery.Unverified -> {
+                    System.err.println(
+                        "[WARN] Unverified message from " +
+                            "${delivery.message.sourceHash.toHexString()}: ${delivery.reason}"
+                    )
+                    handleIncomingMessage(delivery.message)
+                }
+            }
         }
 
         // Start the router's background processing

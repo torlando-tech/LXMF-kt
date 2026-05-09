@@ -17,6 +17,7 @@ import network.reticulum.interop.getString
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXStamper
 import network.reticulum.lxmf.MessageState
 import org.junit.jupiter.api.Test
@@ -45,9 +46,19 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
 
     private fun registerDeliveryCallback() {
         receivedMessages.clear()
-        kotlinRouter.registerDeliveryCallback { message ->
-            println("[KT] Received message via delivery callback: ${message.title} - ${message.content}")
-            receivedMessages.add(message)
+        kotlinRouter.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified -> {
+                    val message = delivery.message
+                    println("[KT] Received message via delivery callback: ${message.title} - ${message.content}")
+                    receivedMessages.add(message)
+                }
+                is LXMessageDelivery.Unverified -> error(
+                    "test setup bug: unverified delivery from python — sender's identity should " +
+                        "have been registered with kotlin receiver via Identity.remember(). " +
+                        "Reason: ${delivery.reason}"
+                )
+            }
         }
     }
 

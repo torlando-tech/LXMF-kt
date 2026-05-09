@@ -11,6 +11,7 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.MessageState
 import network.reticulum.transport.Transport
@@ -90,8 +91,13 @@ class DeliveryConfirmTest {
         myDestination = router.registerDeliveryIdentity(identity, "Delivery Test Client")
 
         // Register callback for incoming messages (echoes)
-        router.registerDeliveryCallback { message ->
-            log("Received echo: ${message.content}")
+        router.registerDeliveryCallback { delivery ->
+            when (delivery) {
+                is LXMessageDelivery.Verified ->
+                    log("Received echo: ${delivery.message.content}")
+                is LXMessageDelivery.Unverified ->
+                    log("Received UNVERIFIED echo (${delivery.reason}): ${delivery.message.content}")
+            }
         }
 
         router.start()

@@ -14,6 +14,7 @@ import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXMessageDelivery
 import network.reticulum.lxmf.MessageState
 import network.reticulum.transport.Transport
 import org.json.JSONArray
@@ -351,11 +352,29 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
 
         deliveryDest = router.registerDeliveryIdentity(identity, displayName = displayName)
 
-        router.registerDeliveryCallback { message ->
+        router.registerDeliveryCallback { delivery ->
             // Drop late callbacks that fire on background threads after
             // cmdLxmfShutdown cleared the inbox. Otherwise they re-add
             // the entry and the next test sees stale state.
             if (BridgeState.shuttingDown) return@registerDeliveryCallback
+            // Unwrap the sealed delivery type. Both branches feed the
+            // same inbox so existing wire-E2E tests are unaffected; the
+            // unverified flag is exposed via two new JSON fields so
+            // future conformance tests (lxmf-conformance#10) can assert
+            // on signature-validation contract per impl.
+            val message: LXMessage = delivery.message
+            val unverifiedFlag: Boolean
+            val unverifiedReason: Int?
+            when (delivery) {
+                is LXMessageDelivery.Verified -> {
+                    unverifiedFlag = false
+                    unverifiedReason = null
+                }
+                is LXMessageDelivery.Unverified -> {
+                    unverifiedFlag = true
+                    unverifiedReason = delivery.reason.value
+                }
+            }
             val entry = JSONObject()
             entry.put("message_hash", message.hash?.toHexString() ?: "")
             entry.put("source_hash", message.sourceHash.toHexString())
@@ -366,6 +385,11 @@ private fun cmdLxmfInit(params: JSONObject): JSONObject {
             entry.put("ack_status", "received")
             entry.put("received_at_ms", System.currentTimeMillis())
             entry.put("fields", encodeMessageFields(message))
+            // Surface signature-validation state for cross-impl tests.
+            // Always present so test assertions can compare on every
+            // entry without nullable-key gymnastics.
+            entry.put("unverified", unverifiedFlag)
+            entry.put("unverified_reason", unverifiedReason ?: JSONObject.NULL)
             // Increment seq AND add to inbox under a single lock acquisition.
             // Splitting them across two `withLock` blocks lets a poll between
             // the two release `last_seq=N` (already incremented) without the
