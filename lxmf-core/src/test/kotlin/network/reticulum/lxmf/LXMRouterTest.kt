@@ -1119,4 +1119,151 @@ class LXMRouterTest {
         } catch (e: Exception) {
             LXMRouter.PropagationTransferState.IDLE
         }
+
+    // ===== lxmf.delivery announce-handler wiring =====
+    //
+    // Tracks the bug where LXMRouter only registered an announce handler for
+    // "lxmf.propagation" — never for "lxmf.delivery" — even though
+    // handleDeliveryAnnounce() exists and parses stamp_cost from the app data
+    // correctly. The result was outboundStampCosts never populated from peer
+    // announces, so handleOutbound emitted unstamped wire bytes that any
+    // enforce_stamps()-enabled receiver (Sideband with lxmf_require_stamps=True)
+    // dropped with "Dropping {message} with invalid stamp".
+    //
+    // Python LXMRouter.__init__ registers BOTH handlers (LXMRouter.py:191):
+    //
+    //     RNS.Transport.register_announce_handler(LXMFDeliveryAnnounceHandler(self))
+    //     RNS.Transport.register_announce_handler(LXMFPropagationAnnounceHandler(self))
+    //
+    // These tests pin source-of-truth parity with that code.
+
+    /** Reflection probe — Transport's `announceHandlers` list is private. */
+    private fun transportAnnounceHandlerAspectFilters(): List<String?> {
+        val transport = network.reticulum.transport.Transport
+        val field = transport.javaClass.getDeclaredField("announceHandlers")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val handlers = field.get(transport) as Iterable<Any>
+        return handlers.map { entry ->
+            val af = entry.javaClass.getDeclaredField("aspectFilter")
+            af.isAccessible = true
+            af.get(entry) as String?
+        }
+    }
+
+    @Test
+    fun `LXMRouter init registers announce handler for lxmf-delivery aspect`() {
+        // Snapshot the *count* of handlers with this aspect filter rather than
+        // an absolute number — Transport is a singleton and prior tests in this
+        // class accumulate handlers in it (close() doesn't deregister), so the
+        // pre-condition value is whatever the test order yields.
+        val before = transportAnnounceHandlerAspectFilters().count { it == "lxmf.delivery" }
+
+        // Construct a fresh router. The wiring happens in init, not start().
+        val newRouter = LXMRouter(identity = Identity.create())
+        try {
+            val after = transportAnnounceHandlerAspectFilters().count { it == "lxmf.delivery" }
+
+            // Pre-fix: delta == 0 (only "lxmf.propagation" got wired).
+            // Post-fix: delta == 1 (both aspects wired, mirroring Python).
+            assertEquals(
+                before + 1,
+                after,
+                "LXMRouter must register an announce handler with " +
+                    "aspectFilter=\"lxmf.delivery\" so peer announces populate " +
+                    "outboundStampCosts. Without this, handleOutbound emits " +
+                    "unstamped wire bytes and enforce_stamps()-enabled receivers " +
+                    "(Sideband) drop them with \"invalid stamp\".",
+            )
+        } finally {
+            newRouter.close()
+        }
+    }
+
+    @Test
+    fun `LXMRouter init registers announce handler for lxmf-propagation aspect`() {
+        // Companion to the lxmf-delivery test — guards against a future fix
+        // that accidentally drops the propagation registration while adding
+        // the delivery one. Both must be registered, matching Python.
+        val before = transportAnnounceHandlerAspectFilters().count { it == "lxmf.propagation" }
+        val newRouter = LXMRouter(identity = Identity.create())
+        try {
+            val after = transportAnnounceHandlerAspectFilters().count { it == "lxmf.propagation" }
+            assertEquals(
+                before + 1,
+                after,
+                "LXMRouter must keep registering the lxmf.propagation handler — " +
+                    "the propagation-node discovery flow depends on it.",
+            )
+        } finally {
+            newRouter.close()
+        }
+    }
+
+    @Test
+    fun `inbound delivery announce auto-configures outbound stampCost on next handleOutbound`() = runBlocking {
+        // End-to-end behavioral pin: simulate Sideband's announce arriving via
+        // handleDeliveryAnnounce, then send a message to that destination.
+        // handleOutbound should consult outboundStampCosts and copy the
+        // announced cost onto the outgoing message, so the stamp gets generated.
+        //
+        // This test passes today (handleDeliveryAnnounce works in isolation),
+        // but documents the full pipeline so a future regression in any link in
+        // the chain (announce parse → cache write → handleOutbound auto-config
+        // → getStamp + repackWithStamp) surfaces here.
+
+        val sidebandIdentity = Identity.create()
+        val sidebandDest = Destination.create(
+            identity = sidebandIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery",
+        )
+
+        // Sideband-shaped announce: msgpack([display_name_bytes_or_nil, stamp_cost])
+        val appData = java.io.ByteArrayOutputStream().apply {
+            val packer = org.msgpack.core.MessagePack.newDefaultPacker(this)
+            packer.packArrayHeader(2)
+            val name = "Sideband".toByteArray(Charsets.UTF_8)
+            packer.packBinaryHeader(name.size); packer.writePayload(name)
+            packer.packInt(8) // stamp_cost
+            packer.close()
+        }.toByteArray()
+
+        router.handleDeliveryAnnounce(sidebandDest.hash, appData)
+
+        // Compose a message destined for Sideband. Source destination must have
+        // a private-keyed identity for pack() to sign; reuse the test identity.
+        val sourceDest = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery",
+        )
+        val msg = LXMessage.create(
+            destination = sidebandDest,
+            source = sourceDest,
+            content = "ping",
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC,
+        )
+        assertNull(msg.stampCost, "stampCost should start unset before handleOutbound")
+
+        router.handleOutbound(msg)
+
+        assertEquals(
+            8,
+            msg.stampCost,
+            "handleOutbound must copy the announced stamp_cost from " +
+                "outboundStampCosts onto the message so getStamp generates a stamp.",
+        )
+        assertNotNull(
+            msg.stamp,
+            "After auto-configuring stampCost, handleOutbound must generate a " +
+                "stamp via getStamp() and include it in the wire bytes via " +
+                "repackWithStamp() — otherwise enforce_stamps()-enabled " +
+                "receivers will drop the message.",
+        )
+    }
 }
