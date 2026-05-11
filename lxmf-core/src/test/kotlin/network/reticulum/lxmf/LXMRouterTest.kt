@@ -19,6 +19,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.fail
 
 /**
  * Unit tests for LXMRouter.
@@ -1137,15 +1138,39 @@ class LXMRouterTest {
     //
     // These tests pin source-of-truth parity with that code.
 
-    /** Reflection probe — Transport's `announceHandlers` list is private. */
+    /**
+     * Reflection probe — Transport's `announceHandlers` list is private.
+     *
+     * The hard-coded field names ("announceHandlers", "aspectFilter") are
+     * intentionally brittle: a future rename in reticulum-kt's Transport must
+     * surface here so the probe gets updated alongside it. To make that
+     * failure mode unambiguous, NoSuchFieldException is caught and converted
+     * to an explicit `fail(...)` with the field name, instead of leaking a
+     * raw reflection error that could be mistaken for "handler not registered".
+     */
     private fun transportAnnounceHandlerAspectFilters(): List<String?> {
         val transport = network.reticulum.transport.Transport
-        val field = transport.javaClass.getDeclaredField("announceHandlers")
+        val field = try {
+            transport.javaClass.getDeclaredField("announceHandlers")
+        } catch (_: NoSuchFieldException) {
+            fail(
+                "Transport field 'announceHandlers' not found — reticulum-kt " +
+                    "renamed or removed it. Update this reflection probe.",
+            )
+        }
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         val handlers = field.get(transport) as Iterable<Any>
         return handlers.map { entry ->
-            val af = entry.javaClass.getDeclaredField("aspectFilter")
+            val af = try {
+                entry.javaClass.getDeclaredField("aspectFilter")
+            } catch (_: NoSuchFieldException) {
+                fail(
+                    "AnnounceHandler entry field 'aspectFilter' not found on " +
+                        "${entry.javaClass.name} — reticulum-kt renamed or " +
+                        "removed it. Update this reflection probe.",
+                )
+            }
             af.isAccessible = true
             af.get(entry) as String?
         }
