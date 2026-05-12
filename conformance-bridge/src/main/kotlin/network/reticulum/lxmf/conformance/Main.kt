@@ -705,6 +705,42 @@ private fun cmdLxmfGetReceivedMessages(params: JSONObject): JSONObject {
     return JSONObject().put("messages", out).put("last_seq", lastSeq)
 }
 
+/**
+ * Return resource-transfer progress for [message_hash] in [0.0, 1.0], or
+ * the -1.0 sentinel if untracked.
+ *
+ * Mirrors the python reference at
+ * `lxmf-conformance/reference/lxmf_python.py::cmd_lxmf_get_message_progress`,
+ * which itself mirrors microLXMF's `lxmf_get_message_progress`. Reads the
+ * public `LXMessage.progress` field (LXMessage.kt:142) — populated by
+ * `LXMRouter.sendViaLink`'s Resource progressCallback (LXMRouter.kt:1340)
+ * for messages that fall back to RNS Resource transfer (>319 B content).
+ *
+ * Resolution differs slightly from python:
+ *   - Python keeps a `_outbound_progress` snapshot map populated by the
+ *     state callback right before the live reference is popped from
+ *     `_outbound_messages` on terminal state, so polling tests can still
+ *     read 1.0 after `state == 'delivered'`.
+ *   - Kotlin never pops from `outboundMessages` until shutdown
+ *     (Main.kt:854 is the only `.clear()`), so the live reference itself
+ *     persists past delivery and `message.progress = 1.0` (set by the
+ *     completion callback at LXMRouter.kt:1335) survives the same poll
+ *     window. No separate snapshot map needed.
+ *
+ * Untracked = `message_hash` was never inserted into `outboundMessages`
+ * (e.g. send command never ran, or it failed before computing the hash).
+ * Small messages that took the PACKET path are NOT untracked here — they
+ * return 0.0 (the `LXMessage.progress` default), which the test accepts
+ * as a valid "no Resource ticks happened" sample (≥0 passes its filter).
+ */
+private fun cmdLxmfGetMessageProgress(params: JSONObject): JSONObject {
+    ensureRouter("lxmf_get_message_progress")
+    val hashHex = params.getString("message_hash")
+    val live = BridgeState.outboundMessages[hashHex]
+    val progress = live?.progress ?: -1.0
+    return JSONObject().put("progress", progress)
+}
+
 private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
     ensureRouter("lxmf_get_message_state")
     val hashHex = params.getString("message_hash")
@@ -874,6 +910,7 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_sync_inbound" to ::cmdLxmfSyncInbound,
     "lxmf_get_received_messages" to ::cmdLxmfGetReceivedMessages,
     "lxmf_get_message_state" to ::cmdLxmfGetMessageState,
+    "lxmf_get_message_progress" to ::cmdLxmfGetMessageProgress,
     "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
 )
