@@ -280,15 +280,42 @@ class LXMRouter(
         loadAvailableTickets()
         loadTransientIds()
 
-        // Register announce handler for propagation nodes with aspect filter.
-        // Transport only calls this for announces matching "lxmf.propagation".
+        // Register announce handlers, mirroring Python LXMRouter.__init__:
+        //
+        //     RNS.Transport.register_announce_handler(LXMFDeliveryAnnounceHandler(self))
+        //     RNS.Transport.register_announce_handler(LXMFPropagationAnnounceHandler(self))
+        //
+        // Both registrations are required. Without the lxmf.delivery handler,
+        // outboundStampCosts never gets populated from peer announces — so
+        // handleOutbound emits unstamped wire bytes that any
+        // enforce_stamps()-enabled receiver (Sideband with
+        // lxmf_require_stamps=True) drops with "Dropping {message} with
+        // invalid stamp". Symptom in the wild: Columba sees a delivery proof
+        // (RNS-level) but the message never appears at Sideband, only when
+        // stamp_cost > 0 is configured on the receiver.
+
+        // lxmf.delivery — Python LXMF/Handlers.py:LXMFDeliveryAnnounceHandler.
+        // Transport only calls this handler for announces matching the
+        // "lxmf.delivery" destination aspect.
+        Transport.registerAnnounceHandler(
+            handler =
+                AnnounceHandler { destHash, _, appData ->
+                    if (appData != null && appData.isNotEmpty()) {
+                        handleDeliveryAnnounce(destHash, appData)
+                    }
+                    false // Don't consume — let other handlers see it too.
+                },
+            aspectFilter = "lxmf.delivery",
+        )
+
+        // lxmf.propagation — Python LXMF/Handlers.py:LXMFPropagationAnnounceHandler.
         Transport.registerAnnounceHandler(
             handler =
                 AnnounceHandler { destHash, identity, appData ->
                     if (appData != null && appData.isNotEmpty()) {
                         handlePropagationAnnounce(destHash, identity, appData)
                     }
-                    false // Don't consume - let other handlers see it too
+                    false // Don't consume — let other handlers see it too.
                 },
             aspectFilter = "lxmf.propagation",
         )
@@ -1725,12 +1752,29 @@ class LXMRouter(
             println("Error parsing delivery announce: ${e.message}")
         }
 
-        // Trigger retry for pending messages to this destination
+        // Trigger retry for pending DIRECT/OPPORTUNISTIC messages to this
+        // destination. Mirrors Python LXMFDeliveryAnnounceHandler.received_announce
+        // (Handlers.py:LXMFDeliveryAnnounceHandler):
+        //
+        //     for lxmessage in self.lxmrouter.pending_outbound:
+        //         if destination_hash     == lxmessage.destination_hash:
+        //             if lxmessage.method == LXMessage.DIRECT or lxmessage.method == LXMessage.OPPORTUNISTIC:
+        //                 lxmessage.next_delivery_attempt = time.time()
+        //                 ... process_outbound()
+        //
+        // Filtering by method matters: PROPAGATED messages have their own
+        // delivery driver (link to a propagation node, not to the destination
+        // hash that just announced) and re-triggering them on a delivery
+        // announce can cause spurious dispatch — see PropagatedDeliveryTest
+        // regressions when this filter was missing.
         val destHashHex = destHash.toHexString()
         processingScope.launch {
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
-                    if (message.destinationHash.toHexString() == destHashHex) {
+                    if (message.destinationHash.toHexString() == destHashHex &&
+                        (message.method == DeliveryMethod.DIRECT ||
+                            message.method == DeliveryMethod.OPPORTUNISTIC)
+                    ) {
                         message.nextDeliveryAttempt = System.currentTimeMillis()
                     }
                 }
