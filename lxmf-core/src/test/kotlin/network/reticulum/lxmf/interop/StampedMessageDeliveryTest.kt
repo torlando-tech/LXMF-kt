@@ -379,39 +379,44 @@ class StampedMessageDeliveryTest : LXMFInteropTestBase() {
     inner class UnstampedMessageRejection {
 
         /**
-         * Demonstrates the Columba→Sideband production failure: when no
-         * stampCost is set on the outgoing LXMessage, Kotlin packs a 4-element
-         * payload with NO stamp slot. A Sideband-style receiver with
-         * `stamp_cost > 0` and `enforce_stamps()` calls `validate_stamp()`,
-         * which sees `message.stamp == None` and immediately returns False —
-         * the same path as `LXMRouter.lxmf_delivery` line 1762-1768 that
-         * logs "Dropping {message} with invalid stamp" and returns False
-         * before the application delivery callback fires.
+         * Pins the rejection contract: when no stampCost is set on the
+         * outgoing LXMessage, Kotlin packs a 4-element payload with NO
+         * stamp slot. A Sideband-style receiver with `stamp_cost > 0` and
+         * `enforce_stamps()` calls `validate_stamp()`, sees
+         * `message.stamp == None`, and immediately returns False — the
+         * same path as Python `LXMRouter.lxmf_delivery` line 1762-1768
+         * that logs "Dropping {message} with invalid stamp" and returns
+         * False before the application delivery callback fires.
          *
-         * In production Columba, this happens because LXMRouter (Kotlin) never
-         * registers an announce handler for the `lxmf.delivery` aspect, so
-         * `handleDeliveryAnnounce` is never called and `outboundStampCosts`
-         * stays empty — even though the function exists and parses correctly.
-         * Compare to Python LXMRouter `__init__`:
+         * **Historical context (fixed in this PR):** before this change,
+         * LXMRouter never registered an announce handler for
+         * `lxmf.delivery`, so `outboundStampCosts` was never populated
+         * and every outbound message to an enforcing receiver was
+         * unstamped — that's the bug this PR closes by mirroring Python
+         * `LXMRouter.__init__`'s `LXMFDeliveryAnnounceHandler`
+         * registration. The root cause is gone, but the drop scenario
+         * this test pins is still real: any message that reaches
+         * `handleOutbound` without a `stampCost` (e.g. because the
+         * destination never sent an announce before the first send,
+         * or the announce arrived but had no stamp_cost in the
+         * app_data) will still be rejected by an enforcing receiver.
+         * This test locks that contract in place.
          *
-         *     RNS.Transport.register_announce_handler(LXMFDeliveryAnnounceHandler(self))
-         *     RNS.Transport.register_announce_handler(LXMFPropagationAnnounceHandler(self))
-         *
-         * Kotlin only registers the propagation handler (LXMRouter.kt:285).
-         *
-         * **This test is expected to demonstrate the drop**, not pass cleanly.
-         * It reproduces the live bug as a unit-test signal so a fix
-         * (registering the lxmf.delivery handler in LXMRouter) can be
-         * validated by flipping the assertion direction.
+         * **This test is expected to demonstrate the drop**, not pass
+         * cleanly. If the assertion direction ever flips to
+         * `stamp_valid=true`, investigate whether some new code path is
+         * silently emitting a stamp on messages that didn't ask for one.
          */
         @Test
         fun `unstamped message DROPS at enforcing receiver`() {
             println("\n=== unstamped message + receiver with enforce_stamps ===")
             val message = createTestMessage(content = "Hello with no stamp")
-            // Note: stampCost intentionally NOT set. This is what production
-            // Kotlin handleOutbound does when outboundStampCosts has no
-            // cached entry for the destination — which is ALWAYS the case
-            // because no announce handler ever populates the cache.
+            // Note: stampCost intentionally NOT set. handleOutbound
+            // auto-configures from outboundStampCosts (populated by the
+            // lxmf.delivery announce handler), but if no announce has
+            // arrived for this destination, the cache miss leaves
+            // stampCost null and getStamp() returns null — wire has no
+            // stamp slot.
             message.pack()
             val wire = message.packed!!
             println("  [Kotlin] wire (no stamp): ${wire.size} bytes")
@@ -431,9 +436,10 @@ class StampedMessageDeliveryTest : LXMFInteropTestBase() {
                 // Without a stamp, validate_stamp() returns False immediately.
                 result.getString("stamp_valid") shouldBe "false"
             }
-            println("  CONFIRMED: This is the production drop. Fix: register an")
-            println("  LXMFDeliveryAnnounceHandler so outboundStampCosts gets")
-            println("  populated and handleOutbound includes a stamp.")
+            println("  CONFIRMED: enforcing receiver drops unstamped messages.")
+            println("  The fix in this PR (lxmf.delivery announce handler) prevents")
+            println("  this for normal flows; the test guards against future regressions")
+            println("  in code paths that bypass the stamp-cost auto-config.")
         }
     }
 
