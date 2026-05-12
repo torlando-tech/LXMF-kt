@@ -138,8 +138,26 @@ class LXMessage private constructor(
     /** Description of transport encryption used */
     var transportEncryption: String? = null
 
-    /** Progress of message delivery (0.0 to 1.0) */
-    var progress: Double = 0.0
+    /**
+     * Progress of message delivery (0.0 to 1.0).
+     *
+     * `@Volatile` because writers and readers run on different threads.
+     * Writers: `LXMRouter.processOpportunisticDelivery` (LXMRouter.kt:739,
+     * 755), `LXMRouter.sendViaPropagation`'s Resource progressCallback
+     * (LXMRouter.kt:1258), and `LXMRouter.sendViaLink`'s Resource
+     * progressCallback + completion callback (LXMRouter.kt:1335, 1340) —
+     * all dispatched from `processingScope` coroutines or RNS Resource
+     * background threads. Readers: any caller polling progress for UI
+     * display, plus the conformance bridge's `cmdLxmfGetMessageProgress`
+     * (Main.kt:740) reading from the bridge's JSON-RPC dispatch thread.
+     *
+     * Without `@Volatile`, the JLS allows non-volatile `double` reads to
+     * tear (§17.7) and offers no happens-before edge between the write
+     * and a cross-thread read — visibility of the latest value is
+     * implementation-defined. Python's GIL gives this for free; on JVM
+     * `@Volatile` is the direct equivalent.
+     */
+    @Volatile var progress: Double = 0.0
 
     // ===== Callbacks =====
 
