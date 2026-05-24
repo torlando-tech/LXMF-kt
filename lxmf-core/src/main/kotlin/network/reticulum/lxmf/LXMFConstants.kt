@@ -58,6 +58,29 @@ object LXMFConstants {
     /** Rendering hints */
     const val FIELD_RENDERER = 0x0F
 
+    // Interaction fields (reply / reaction / comment / continuation),
+    // standardised upstream in LXMF.py (commit 764758d, "to be finalized
+    // in 1.0.0"). See the dict-index sub-constants further below.
+
+    /** Reply target — Bytes, full LXMessage.hash. */
+    const val FIELD_REPLY_TO = 0x30
+
+    /** Reply quote — Bytes, quoted content in UTF-8 encoding. */
+    const val FIELD_REPLY_QUOTE = 0x31
+
+    /** Reaction — Dict, keyed by the REACTION_* dict indices below. */
+    const val FIELD_REACTION = 0x40
+
+    /** Comment — Dict, keyed by the COMMENT_* dict indices below. */
+    const val FIELD_COMMENT = 0x41
+
+    /** Continuation — Dict, keyed by the CONTINUATION_* dict indices below. */
+    const val FIELD_CONTINUATION = 0x42
+
+    // Unallocated fields between 0x00 and 0x80, both included, should be
+    // considered reserved for future extensibility. For experimental and
+    // unstable features, it is recommended to use fields above 0xFF.
+
     // Custom fields (0xFB-0xFF) for extensibility
 
     /** Custom format/type/protocol identifier */
@@ -116,6 +139,22 @@ object LXMFConstants {
 
     /** BBCode rendering */
     const val RENDERER_BBCODE = 0x03
+
+    // ===== Interaction dict indices =====
+    // Dict indices are integers to preserve bandwidth. Mirrors the
+    // "Reaction / Comment / Continuation dict indices" block in LXMF.py.
+
+    /** FIELD_REACTION key — Bytes, full LXMessage.hash being reacted to. */
+    const val REACTION_TO = 0x00
+
+    /** FIELD_REACTION key — Bytes, the reaction content in UTF-8 encoding. */
+    const val REACTION_CONTENT = 0x01
+
+    /** FIELD_COMMENT key — Bytes, full LXMessage.hash being commented on. */
+    const val COMMENT_FOR = 0x00
+
+    /** FIELD_CONTINUATION key — Bytes, full LXMessage.hash being continued. */
+    const val CONTINUATION_OF = 0x00
 
     // ===== Propagation Node Metadata Fields =====
 
