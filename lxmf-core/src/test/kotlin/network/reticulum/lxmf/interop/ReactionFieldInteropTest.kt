@@ -3,10 +3,7 @@ package network.reticulum.lxmf.interop
 import io.kotest.assertions.assertSoftly
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
-import network.reticulum.interop.getString
-import network.reticulum.interop.toHex
 import network.reticulum.lxmf.LXMFConstants
 import org.junit.jupiter.api.Test
 import kotlin.random.Random
@@ -30,15 +27,6 @@ import kotlin.random.Random
  * bridge's nested representation.
  */
 class ReactionFieldInteropTest : LXMFInteropTestBase() {
-
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject =
-        python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-
-    private fun parseFieldType(pythonResult: JsonObject, fieldKey: Int): String? {
-        val fieldsHex = pythonResult["fields_hex"]?.jsonObject ?: return null
-        val fieldObj = fieldsHex[fieldKey.toString()]?.jsonObject ?: return null
-        return fieldObj.getString("type")
-    }
 
     @Test
     fun `FIELD_REACTION canonical 0x40 nested dict round-trips to Python`() {
