@@ -62,14 +62,18 @@ class ReactionFieldInteropTest : LXMFInteropTestBase() {
         println("  [Kotlin] Packed ${packed.size} bytes with FIELD_REACTION (0x40)")
 
         val pythonResult = verifyInPythonWithFields(packed)
-        val fieldsHex = pythonResult["fields_hex"]?.jsonObject
+        // Hard precondition: without fields_hex nothing below is meaningful, and a
+        // null deref inside assertSoftly would throw a RuntimeException that escapes
+        // the soft block and hides the other collected failures.
+        val fieldsHex = requireNotNull(pythonResult["fields_hex"]?.jsonObject) {
+            "Python returned no fields_hex for the packed reaction message"
+        }
         val reactionType = parseFieldType(pythonResult, LXMFConstants.FIELD_REACTION)
         println("  [Python] FIELD_REACTION type: $reactionType")
 
         assertSoftly {
             // Python LXMF unpacked the message and surfaced field 0x40 ("64").
-            fieldsHex shouldNotBe null
-            fieldsHex!!.containsKey(LXMFConstants.FIELD_REACTION.toString()) shouldBe true
+            fieldsHex.containsKey(LXMFConstants.FIELD_REACTION.toString()) shouldBe true
             // The nested int-keyed bytes dict survives as a structured type
             // (not collapsed to bytes / dropped).
             reactionType shouldNotBe null
