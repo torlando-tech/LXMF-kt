@@ -24,16 +24,6 @@ import kotlin.random.Random
  */
 class TelemetryFieldInteropTest : LXMFInteropTestBase() {
 
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject {
-        return python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-    }
-
-    private fun parseFieldType(pythonResult: JsonObject, fieldKey: Int): String? {
-        val fieldsHex = pythonResult["fields_hex"]?.jsonObject ?: return null
-        val fieldObj = fieldsHex[fieldKey.toString()]?.jsonObject ?: return null
-        return fieldObj.getString("type")
-    }
-
     private fun parseBytesField(pythonResult: JsonObject, fieldKey: Int): ByteArray? {
         val fieldsHex = pythonResult["fields_hex"]?.jsonObject ?: return null
         val fieldObj = fieldsHex[fieldKey.toString()]?.jsonObject ?: return null

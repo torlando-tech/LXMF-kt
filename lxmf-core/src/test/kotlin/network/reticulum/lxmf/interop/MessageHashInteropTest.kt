@@ -3,7 +3,6 @@ package network.reticulum.lxmf.interop
 import io.kotest.assertions.assertSoftly
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
-import kotlinx.serialization.json.JsonObject
 import network.reticulum.interop.getString
 import network.reticulum.interop.toHex
 import network.reticulum.lxmf.LXMFConstants
@@ -21,21 +20,6 @@ import org.junit.jupiter.api.Test
  * is computed over hashedPart + hash.
  */
 class MessageHashInteropTest : LXMFInteropTestBase() {
-
-    /**
-     * Verify message in Python using lxmf_unpack_with_fields command.
-     * This handles binary field values properly for JSON serialization.
-     */
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject {
-        val startTime = System.currentTimeMillis()
-
-        val result = python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-
-        val elapsed = System.currentTimeMillis() - startTime
-        println("  [Python] lxmf_unpack_with_fields completed in ${elapsed}ms")
-
-        return result
-    }
 
     @Nested
     @DisplayName("BasicHashComputation")

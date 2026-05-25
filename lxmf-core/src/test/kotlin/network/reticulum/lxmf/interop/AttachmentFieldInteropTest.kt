@@ -114,20 +114,6 @@ class AttachmentFieldInteropTest : LXMFInteropTestBase() {
         }
     }
 
-    /**
-     * Verify message in Python using the new lxmf_unpack_with_fields command.
-     */
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject {
-        val startTime = System.currentTimeMillis()
-
-        val result = python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-
-        val elapsed = System.currentTimeMillis() - startTime
-        println("  [Python] lxmf_unpack_with_fields completed in ${elapsed}ms")
-
-        return result
-    }
-
     @Test
     fun `single text attachment round-trips correctly`() {
         println("\n=== Test: single text attachment round-trips correctly ===")

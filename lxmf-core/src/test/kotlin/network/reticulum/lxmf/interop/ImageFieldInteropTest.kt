@@ -151,20 +151,6 @@ class ImageFieldInteropTest : LXMFInteropTestBase() {
         return ParsedImageField(extension, content)
     }
 
-    /**
-     * Verify message in Python using lxmf_unpack_with_fields command.
-     */
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): kotlinx.serialization.json.JsonObject {
-        val startTime = System.currentTimeMillis()
-
-        val result = python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-
-        val elapsed = System.currentTimeMillis() - startTime
-        println("  [Python] lxmf_unpack_with_fields completed in ${elapsed}ms")
-
-        return result
-    }
-
     @Test
     fun `webp image field round-trips correctly`() {
         println("\n=== Test: webp image field round-trips correctly ===")

@@ -3,6 +3,7 @@ package network.reticulum.lxmf.interop
 import io.kotest.assertions.assertSoftly
 import io.kotest.matchers.shouldBe
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
@@ -158,5 +159,37 @@ abstract class LXMFInteropTestBase : InteropTestBase() {
             kotlinMessage.hash?.toHex() shouldBe pythonResult.getString("message_hash")
                 .also { println("  ${prefix}message_hash: ${kotlinMessage.hash?.toHex()}") }
         }
+    }
+
+    /**
+     * Verify an LXMF message in Python via the bridge, returning the full
+     * field map. Sends the packed bytes to Python's `lxmf_unpack_with_fields`
+     * command (vs [verifyInPython], which uses `lxmf_unpack` without fields).
+     *
+     * Shared by every interop suite that asserts on `fields_hex` so the
+     * bridge command + result schema live in exactly one place.
+     *
+     * @param lxmfBytes Packed LXMF message bytes
+     * @return JsonObject with unpacked message including the `fields_hex` map
+     */
+    protected fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject {
+        val startTime = System.currentTimeMillis()
+
+        val result = python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
+
+        val elapsed = System.currentTimeMillis() - startTime
+        println("  [Python] lxmf_unpack_with_fields completed in ${elapsed}ms")
+
+        return result
+    }
+
+    /**
+     * Read the bridge-reported `type` of a single field from a
+     * [verifyInPythonWithFields] result, or null if the field is absent.
+     */
+    protected fun parseFieldType(pythonResult: JsonObject, fieldKey: Int): String? {
+        val fieldsHex = pythonResult["fields_hex"]?.jsonObject ?: return null
+        val fieldObj = fieldsHex[fieldKey.toString()]?.jsonObject ?: return null
+        return fieldObj.getString("type")
     }
 }

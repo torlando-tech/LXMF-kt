@@ -27,20 +27,6 @@ import kotlin.random.Random
 class CustomFieldInteropTest : LXMFInteropTestBase() {
 
     /**
-     * Verify message in Python using the lxmf_unpack_with_fields command.
-     */
-    private fun verifyInPythonWithFields(lxmfBytes: ByteArray): JsonObject {
-        val startTime = System.currentTimeMillis()
-
-        val result = python("lxmf_unpack_with_fields", "lxmf_bytes" to lxmfBytes.toHex())
-
-        val elapsed = System.currentTimeMillis() - startTime
-        println("  [Python] lxmf_unpack_with_fields completed in ${elapsed}ms")
-
-        return result
-    }
-
-    /**
      * Parse an integer field value from the fields_hex structure.
      * Handles msgpack Long vs Int deserialization.
      */
