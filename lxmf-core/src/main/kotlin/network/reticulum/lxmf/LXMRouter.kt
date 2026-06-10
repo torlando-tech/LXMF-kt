@@ -674,6 +674,10 @@ class LXMRouter(
     @org.jetbrains.annotations.VisibleForTesting
     internal var testHookOnProcessOutboundMessage: (suspend (LXMessage) -> Unit)? = null
 
+    /** Test seam: the current DIRECT delivery link for a destination, if any. */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal fun directLinkForTest(destHashHex: String): Link? = directLinks[destHashHex]
+
     /**
      * Process a single outbound message based on its delivery method.
      */
@@ -916,29 +920,51 @@ class LXMRouter(
             }
 
             link != null && link.status == LinkConstants.CLOSED -> {
-                // Link is closed (likely establishment timeout). Clear it and
-                // schedule a retry; the next tick will hit the no-link branch
-                // and bump deliveryAttempts. (Python LXMRouter.py:2625-2629.)
+                // Safety net only. In kt the per-link [closedCallback] in
+                // [establishLinkForMessage] fires on close and eagerly removes the
+                // link from directLinks (+ re-requests the path — see there), so a
+                // CLOSED link is almost never observed here; the next tick lands in
+                // the no-link branch. Python's per-message CLOSED branch
+                // (LXMRouter.py:2610-2629) is relocated to that callback because
+                // kt's link lifecycle is event-driven (see port-deviations.md).
+                // If we do see a CLOSED link (close-callback race), just clear both
+                // link maps and reschedule.
                 directLinks.remove(destHashHex)
+                backchannelLinks.remove(destHashHex)
                 pendingLinkEstablishments.remove(destHashHex)
                 message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
 
             else -> {
-                // No link exists. Bump attempts and try to create one — but
-                // only after the retry-wait window has elapsed, so we don't
-                // burn the budget on rapid-fire ticks. (Python LXMRouter.py:2637-2639.)
+                // No link exists. Try to establish one, but only if we've never
+                // tried before or the retry-wait window has elapsed. Port of
+                // Python LXMRouter.py:2633-2652.
                 val now = System.currentTimeMillis()
                 val nextAttempt = message.nextDeliveryAttempt ?: 0L
                 if (nextAttempt == 0L || now >= nextAttempt) {
                     message.deliveryAttempts++
-                    if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
-                        message.state = MessageState.FAILED
-                        message.failedCallback?.invoke(message)
-                        return
-                    }
                     message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
-                    establishLinkForMessage(message)
+
+                    // Strictly `<` MAX (Python :2641): on the attempt that reaches
+                    // MAX we neither establish nor request — the next tick's
+                    // top-of-function check (deliveryAttempts > MAX) fails the
+                    // message and invokes failedCallback, matching Python's
+                    // `<= MAX` gate at :2579 + fail_message at :2655.
+                    if (message.deliveryAttempts < MAX_DELIVERY_ATTEMPTS) {
+                        if (Transport.hasPath(message.destinationHash)) {
+                            // Path known — establish the link. (:2642-2647)
+                            establishLinkForMessage(message)
+                            message.progress = 0.03
+                        } else {
+                            // No path — request one and wait PATH_REQUEST_WAIT before
+                            // the next attempt. This is the core columba#1004 fix:
+                            // DIRECT delivery now requests a path instead of blindly
+                            // attempting a link against a missing/stale path. (:2648-2652)
+                            Transport.requestPath(message.destinationHash)
+                            message.nextDeliveryAttempt = now + PATH_REQUEST_WAIT
+                            message.progress = 0.01
+                        }
+                    }
                 }
             }
         }
@@ -986,6 +1012,33 @@ class LXMRouter(
                         triggerProcessing()
                     },
                     closedCallback = { closedLink ->
+                        // Re-request the path when a DIRECT delivery link closes.
+                        // Port of Python's CLOSED-branch logic (LXMRouter.py:2610-2622):
+                        // Python runs this per-message in process_outbound, but kt's
+                        // link lifecycle is event-driven and removes the link from
+                        // directLinks here (so processDirectDelivery's CLOSED branch is
+                        // pre-empted), so the re-request is replicated at the close
+                        // event. See port-deviations.md. Without this, transport-enabled
+                        // nodes — where reticulum-kt's Transport.deregisterLink path
+                        // recovery is intentionally gated off (Python parity) — had no
+                        // way to refresh a stale path after a failed link (columba#1004).
+                        //
+                        // Gate on the message still needing delivery so a normal
+                        // post-delivery close doesn't emit a spurious request (Python's
+                        // CLOSED branch only runs for messages still in the outbound loop).
+                        val stillDelivering = message.state == MessageState.OUTBOUND ||
+                            message.state == MessageState.SENDING
+                        if (stillDelivering) {
+                            if (closedLink.activatedAt > 0) {
+                                // Was active, closed unexpectedly — refresh the path. (:2611-2613)
+                                Transport.requestPath(message.destinationHash)
+                            } else if (!message.pathRequestRetried) {
+                                // Never activated — retry the path request exactly once. (:2615-2618)
+                                Transport.requestPath(message.destinationHash)
+                                message.pathRequestRetried = true
+                            }
+                        }
+
                         // Link closed
                         directLinks.remove(destHashHex)
                         pendingLinkEstablishments.remove(destHashHex)

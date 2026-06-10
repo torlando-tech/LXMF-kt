@@ -175,6 +175,15 @@ class LXMessage private constructor(
     /** Next delivery attempt timestamp (milliseconds) */
     var nextDeliveryAttempt: Long? = null
 
+    /**
+     * Whether a path re-request has already been issued for a CLOSED delivery
+     * link that never activated. Transient delivery-state — NOT part of the
+     * packed wire format. Mirrors Python LXMF's dynamic `path_request_retried`
+     * attribute (LXMRouter.py:2615-2618), which gates the never-activated retry
+     * to exactly once.
+     */
+    var pathRequestRetried: Boolean = false
+
     // ===== Receive-time Packet Metadata =====
     //
     // The following fields are populated from the delivering Reticulum packet

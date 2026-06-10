@@ -410,6 +410,12 @@ class LXMRouterTest {
             while (message.state != MessageState.FAILED &&
                 message.state != MessageState.DELIVERED
             ) {
+                // Post-fix, the no-link branch defers failure to the next *due*
+                // tick (Python parity: bump to MAX+1, set nextDeliveryAttempt =
+                // +DELIVERY_RETRY_WAIT, then the next tick's top-of-function check
+                // fails it) instead of failing inline. Force each tick due so the
+                // message isn't gated behind the retry-wait for the whole timeout.
+                message.nextDeliveryAttempt = 0L
                 delay(50)
                 router.processOutbound()
             }
