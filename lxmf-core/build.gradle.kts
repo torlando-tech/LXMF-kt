@@ -20,19 +20,13 @@ dependencies {
     // api scope: lxmf-core's public API (LXMRouter, LXMessage) exposes
     // rns-core types (Destination, Identity) as parameters and return types,
     // so consumers need rns-core on their compile classpath.
-    //
-    // TODO(columba#1004): `0.0.22-1004dev` is a LOCAL dev placeholder published
-    // via `publishToMavenLocal` from the reticulum-kt PR-1 branch
-    // (fix/request-path-python-parity). Replace all three reticulum-kt pins
-    // below with PR 1's real tag once it is merged + tagged. Until then, build
-    // with `LOCAL_RETICULUM_KT_VIA_MAVEN_LOCAL=1`.
-    api("com.github.torlando-tech.reticulum-kt:rns-core:0.0.22-1004dev")
+    api("com.github.torlando-tech.reticulum-kt:rns-core:v0.0.22")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
 
     // Test dependencies for live networking tests
-    testImplementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:0.0.22-1004dev")
+    testImplementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:v0.0.22")
 
     // MessagePack for serialization (already in rns-core, but explicit)
     implementation("org.msgpack:msgpack-core:0.9.8")
@@ -49,7 +43,7 @@ dependencies {
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.9")
 
     // Interop testing - reuse Python bridge infrastructure from rns-test
-    testImplementation("com.github.torlando-tech.reticulum-kt:rns-test:0.0.22-1004dev")
+    testImplementation("com.github.torlando-tech.reticulum-kt:rns-test:v0.0.22")
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
 
     // Compression - Apache Commons Compress for BZ2 interop tests
