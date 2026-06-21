@@ -282,8 +282,6 @@ class DirectDeliveryPathRequestTest {
         assertEquals(0, pathRequestCountFor(dest.hash))
 
         // Link never activated (still PENDING). Closing it fires the
-        // closedCallback synchronously, which re-requests the path once.
-        // Link never activated (still PENDING). Closing it fires the
         // closedCallback synchronously, which re-requests the path once. In
         // transport mode reticulum-kt's deregisterLink recovery is gated off, so
         // the closedCallback is the only source: exactly one logical request.

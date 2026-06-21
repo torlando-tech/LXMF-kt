@@ -877,11 +877,6 @@ class LXMRouter(
 
         val destHashHex = message.destinationHash.toHexString()
 
-        // Debug logging
-        println("[LXMRouter] processDirectDelivery: destHashHex=$destHashHex")
-        println("[LXMRouter] processDirectDelivery: directLinks keys=${directLinks.keys}")
-        println("[LXMRouter] processDirectDelivery: backchannelLinks keys=${backchannelLinks.keys}")
-
         // Check for existing active link — prefer directLinks (WE initiated),
         // fall back to backchannelLinks (THEY initiated). Python LXMF sets up
         // resource receive callbacks on ALL links via delivery_link_established,
@@ -894,17 +889,6 @@ class LXMRouter(
                 link = backchannel
             }
         }
-        println(
-            "[LXMRouter] processDirectDelivery: found link=${link != null}, status=${link?.status}, source=${if (link != null &&
-                backchannelLinks.containsValue(
-                    link,
-                )
-            ) {
-                "backchannel"
-            } else {
-                "direct"
-            }}",
-        )
 
         when {
             link != null && link.status == LinkConstants.ACTIVE -> {
