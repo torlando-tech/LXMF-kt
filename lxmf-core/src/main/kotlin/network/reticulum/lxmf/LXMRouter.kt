@@ -58,6 +58,24 @@ class LXMRouter(
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
 
+        /**
+         * Propagation-node path-request timeout, in milliseconds.
+         *
+         * Mirrors python `LXMRouter.PR_PATH_TIMEOUT = 10` (seconds) at
+         * `LXMF/LXMRouter.py:59`. Used by the path-wait job that runs after
+         * `requestMessagesFromPropagationNode()` issues an explicit
+         * `Transport.requestPath` because the active propagation node has
+         * no known path.
+         */
+        const val PR_PATH_TIMEOUT_MS = 10_000L
+
+        /**
+         * Poll interval for the propagation-node path-wait job, in
+         * milliseconds. Mirrors python `time.sleep(0.1)` in
+         * `__request_messages_path_job` at `LXMF/LXMRouter.py:1408`.
+         */
+        const val PR_PATH_POLL_INTERVAL_MS = 100L
+
         /** Maximum pathless delivery attempts before requesting path */
         const val MAX_PATHLESS_TRIES = 1
 
@@ -141,6 +159,23 @@ class LXMRouter(
     /** Link to active propagation node */
     @Volatile
     private var outboundPropagationLink: Link? = null
+
+    /**
+     * Destination hash the path-wait job (started by
+     * `requestMessagesFromPropagationNode` when no path is known) is waiting
+     * on. `null` when no wait is in progress. Mirrors python
+     * `wants_download_on_path_available_from` at `LXMF/LXMRouter.py:517`.
+     */
+    @Volatile
+    private var wantsDownloadOnPathAvailableFrom: ByteArray? = null
+
+    /**
+     * Wall-clock deadline (epoch ms) at which the path-wait job gives up.
+     * Mirrors python `wants_download_on_path_available_timeout` at
+     * `LXMF/LXMRouter.py:519`.
+     */
+    @Volatile
+    private var wantsDownloadOnPathAvailableTimeoutMs: Long = 0L
 
     /** Propagation transfer state */
     @Volatile
@@ -2190,7 +2225,23 @@ class LXMRouter(
             return
         }
 
-        propagationTransferState = PropagationTransferState.LINK_ESTABLISHING
+        // Defensive re-entry guard. A second caller (e.g. periodic sync timer
+        // overlapping a manual sync) arriving during PATH_REQUESTED would
+        // otherwise spawn a parallel `requestMessagesPathJob` — when the path
+        // resolves, both jobs would re-enter and race two concurrent
+        // `establishPropagationLink` calls. The legitimate retry from the
+        // path-wait job nulls `wantsDownloadOnPathAvailableFrom` before
+        // recursing, so the `!= null` clause lets that retry through.
+        // Python's reference (LXMRouter.py:484) carries the same race; we
+        // diverge intentionally because JVM coroutines hit it more readily
+        // than python threads under the GIL.
+        if (propagationTransferState == PropagationTransferState.PATH_REQUESTED &&
+            wantsDownloadOnPathAvailableFrom != null
+        ) {
+            println("[LXMRouter] requestMessages: path-wait already in progress, ignoring duplicate call")
+            return
+        }
+
         propagationTransferProgress = 0.0
         propagationTransferLastResult = 0
 
@@ -2207,11 +2258,73 @@ class LXMRouter(
             // ERROR_NO_IDENTITY (240) on /get requests.
             identifyOnLink(link)
             requestMessageList(link)
+        } else if (link == null) {
+            // Mirror python `request_messages_from_propagation_node` at
+            // LXMF/LXMRouter.py:503-521: only attempt to establish a link
+            // when Transport already knows a path. Otherwise, request the
+            // path and let the path-wait job re-enter this function once
+            // the path arrives. Without this preflight, Link.create issues
+            // a hopeful broadcast with no route and the propagation
+            // transfer stalls in LINK_ESTABLISHING until the caller's
+            // outer timeout fires.
+            if (Transport.hasPath(node.destHash)) {
+                propagationTransferState = PropagationTransferState.LINK_ESTABLISHING
+                establishPropagationLink(node)
+            } else {
+                println("[LXMRouter] No path known for propagation node ${node.hexHash.take(12)}, requesting path...")
+                Transport.requestPath(node.destHash)
+                wantsDownloadOnPathAvailableFrom = node.destHash
+                wantsDownloadOnPathAvailableTimeoutMs =
+                    System.currentTimeMillis() + PR_PATH_TIMEOUT_MS
+                propagationTransferState = PropagationTransferState.PATH_REQUESTED
+                requestMessagesPathJob()
+            }
         } else {
-            // Need to establish link first
-            establishPropagationLink(node)
+            // Link exists but not yet ACTIVE — establishedCallback will
+            // continue the flow when it fires. Mirrors python
+            // `Waiting for propagation node link to become active` at
+            // LXMRouter.py:523.
+            println("[LXMRouter] Waiting for propagation node link to become active")
         }
         println("[LXMRouter] requestMessages: returning, state=$propagationTransferState")
+    }
+
+    /**
+     * Background poll that waits for `Transport.hasPath` to become true for
+     * `wantsDownloadOnPathAvailableFrom`, then re-enters
+     * `requestMessagesFromPropagationNode` so the link can be established.
+     * On timeout, sets state to `NO_PATH`.
+     *
+     * Mirrors python `__request_messages_path_job` at
+     * `LXMF/LXMRouter.py:1405-1414`. Python uses a daemon thread; we use a
+     * coroutine on `processingScope` (Dispatchers.IO) which serves the same
+     * purpose without blocking caller threads.
+     */
+    private fun requestMessagesPathJob() {
+        processingScope.launch {
+            val deadline = wantsDownloadOnPathAvailableTimeoutMs
+            // Re-read `wantsDownloadOnPathAvailableFrom` on each iteration so
+            // a concurrent reset/cancel that nulls the field cleanly aborts
+            // the wait. Mirrors python LXMRouter.py:1407 which re-reads
+            // `self.wants_download_on_path_available_from` inside its loop
+            // and in the post-loop `has_path` check at LXMRouter.py:1410.
+            while (true) {
+                val current = wantsDownloadOnPathAvailableFrom ?: return@launch
+                if (Transport.hasPath(current)) break
+                if (System.currentTimeMillis() >= deadline) break
+                delay(PR_PATH_POLL_INTERVAL_MS)
+            }
+            val target = wantsDownloadOnPathAvailableFrom ?: return@launch
+            if (Transport.hasPath(target)) {
+                println("[LXMRouter] Path to propagation node resolved, retrying message request")
+                wantsDownloadOnPathAvailableFrom = null
+                requestMessagesFromPropagationNode()
+            } else {
+                println("[LXMRouter] Propagation node path request timed out")
+                wantsDownloadOnPathAvailableFrom = null
+                propagationTransferState = PropagationTransferState.NO_PATH
+            }
+        }
     }
 
     /**
