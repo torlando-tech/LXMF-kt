@@ -1,0 +1,12 @@
+[PASS] bridge init
+[PASS] tcp iface to live lxmd
+[PASS] path to live node learned (announce received)
+[PASS] C1a set outbound propagation node (live)
+[PASS] C1b/C2 client registers + message list/get vs live node — final_state=complete
+[PASS] throwaway 2nd lxmd provisioned under /tmp and running
+[PASS] 2nd bridge init
+[PASS] paths learned in 2-node segment (node1+node2 announces)
+[PASS] C6 set propagation node across 2-node chain
+[PASS] C6 sync completes across 2-node chain — final_state=complete
+
+SUMMARY: 10 passed, 0 failed of 10
