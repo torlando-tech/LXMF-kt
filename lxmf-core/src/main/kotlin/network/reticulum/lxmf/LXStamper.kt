@@ -103,6 +103,82 @@ object LXStamper {
         return stampValue(workblock, stamp)
     }
 
+    /** Workblock expansion rounds for peering-key stamps (Python LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING) */
+    const val WORKBLOCK_EXPAND_ROUNDS_PEERING = 25
+
+    // ==================== Propagation Node Stamp Validation ====================
+    // Ports Python LXMF/LXStamper.py validate_pn_stamp / validate_pn_stamps /
+    // validate_peering_key (node-side surface, P3 card t_a3c5bdbc).
+    //
+    // Deviation vs Python: multiprocessing.Pool fan-out in
+    // validate_pn_stamps_job_multip is replaced by sequential validation on the
+    // caller's dispatcher — structured concurrency substitutes for the process
+    // pool (same documented jobloop→coroutines substitution pattern). Batch CPU
+    // parallelism can be revisited if node throughput requires it.
+
+    /** Validated propagation-node stamp entry (mirrors Python validate_pn_stamp's 4-tuple). */
+    data class PnStampEntry(
+        val transientId: ByteArray,
+        val lxmfData: ByteArray,
+        val value: Int,
+        val stampData: ByteArray,
+    ) {
+        override fun equals(other: Any?): Boolean =
+            other is PnStampEntry &&
+                transientId.contentEquals(other.transientId) &&
+                lxmfData.contentEquals(other.lxmfData) &&
+                value == other.value &&
+                stampData.contentEquals(other.stampData)
+
+        override fun hashCode(): Int =
+            31 * (31 * transientId.contentHashCode() + lxmfData.contentHashCode()) + value
+    }
+
+    /**
+     * Validate a single stamped propagation message transfer blob.
+     *
+     * Mirrors Python LXStamper.validate_pn_stamp(): the wire form is
+     * `<lxmf_data><stamp>`; the transient id is the full hash of the UNstamped
+     * lxmf_data; the stamp is validated against a PN-rounds (1000) workblock.
+     *
+     * @return the validated entry, or null when the blob is too short or the
+     *   stamp does not meet [targetCost].
+     */
+    fun validatePnStamp(
+        transientData: ByteArray,
+        targetCost: Int,
+    ): PnStampEntry? {
+        if (transientData.size <= LXMFConstants.LXMF_OVERHEAD + STAMP_SIZE) return null
+        val lxmfData = transientData.copyOfRange(0, transientData.size - STAMP_SIZE)
+        val stamp = transientData.copyOfRange(transientData.size - STAMP_SIZE, transientData.size)
+        val transientId = sha256(lxmfData)
+        val workblock = generateWorkblock(transientId, WORKBLOCK_EXPAND_ROUNDS_PN)
+        if (!isStampValid(stamp, targetCost, workblock)) return null
+        return PnStampEntry(transientId, lxmfData, stampValue(workblock, stamp), stamp)
+    }
+
+    /** Validate a batch of stamped blobs, dropping invalid entries (order-preserving). */
+    fun validatePnStamps(
+        transientList: List<ByteArray>,
+        targetCost: Int,
+    ): List<PnStampEntry> = transientList.mapNotNull { validatePnStamp(it, targetCost) }
+
+    /**
+     * Validate a propagation-node peering key.
+     *
+     * Mirrors Python LXStamper.validate_peering_key(): the peering key is a
+     * low-cost (25 expansion rounds) proof-of-work over the peering id
+     * (`node_identity_hash + peer_identity_hash`) meeting [targetCost].
+     */
+    fun validatePeeringKey(
+        peeringId: ByteArray,
+        peeringKey: ByteArray,
+        targetCost: Int,
+    ): Boolean {
+        val workblock = generateWorkblock(peeringId, WORKBLOCK_EXPAND_ROUNDS_PEERING)
+        return isStampValid(peeringKey, targetCost, workblock)
+    }
+
     // ==================== Crypto Primitives (delegated) ====================
 
     fun sha256(data: ByteArray): ByteArray = Hashes.fullHash(data)
