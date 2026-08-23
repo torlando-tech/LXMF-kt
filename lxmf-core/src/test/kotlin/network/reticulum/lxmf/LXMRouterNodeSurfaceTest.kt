@@ -173,11 +173,11 @@ class LXMRouterNodeSurfaceTest {
         val now = System.currentTimeMillis() / 1000
         val entryA =
             LXMRouter.PropagationEntry(
-                destinationHash = destA, filePath = "/tmp/a", receivedSeconds = now, sizeBytes = 1000, stampValue = 0,
+                dstHash = destA, filePath = "/tmp/a", receivedAt = now.toDouble(), size = 1000, stampValue = 0,
             )
         val entryB =
             LXMRouter.PropagationEntry(
-                destinationHash = destB, filePath = "/tmp/b", receivedSeconds = now, sizeBytes = 1000, stampValue = 0,
+                dstHash = destB, filePath = "/tmp/b", receivedAt = now.toDouble(), size = 1000, stampValue = 0,
             )
         assertTrue(router.getWeight(entryB) < router.getWeight(entryA))
     }

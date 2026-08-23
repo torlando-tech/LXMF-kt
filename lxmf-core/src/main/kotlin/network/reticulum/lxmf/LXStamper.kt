@@ -106,9 +106,6 @@ object LXStamper {
         return stampValue(workblock, stamp)
     }
 
-    /** Workblock expansion rounds for peering-key stamps (Python LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING) */
-    const val WORKBLOCK_EXPAND_ROUNDS_PEERING = 25
-
     // ==================== Propagation Node Stamp Validation ====================
     // Ports Python LXMF/LXStamper.py validate_pn_stamp / validate_pn_stamps /
     // validate_peering_key (node-side surface, P3 card t_a3c5bdbc).

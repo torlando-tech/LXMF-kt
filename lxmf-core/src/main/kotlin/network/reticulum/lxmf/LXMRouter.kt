@@ -121,7 +121,6 @@ class LXMRouter(
         /** Sync postponement applied when the remote indicates we are throttled (Python PN_STAMP_THROTTLE, seconds). */
         const val PN_STAMP_THROTTLE = 180
 
->>>>>>> 768bb9f3d6ee5178f14aaa92d56578a60d390fe2
     }
 
     // ===== Message Queues =====
@@ -289,20 +288,11 @@ class LXMRouter(
     /** Whether authentication is required for message delivery */
     private var authRequired: Boolean = false
 
-    /** Identity hashes allowed to invoke propagation-node control requests (Python `control_allowed_list`) */
-    private val controlAllowedList = mutableListOf<ByteArray>()
-
     /**
      * Whether invalid-stamp messages are dropped (true) or accepted with a warning (false).
      * Python `_enforce_stamps`; default false — enforcement is opt-in.
      */
     @Volatile private var enforceStampsFlag: Boolean = false
-
-    /**
-     * Whether LXMs already synced from the active propagation node should be retained
-     * on the node after download (Python `retain_synced_on_node`).
-     */
-    @Volatile private var retainSyncedOnNode: Boolean = false
 
     /**
      * Incoming delivery resources still in flight, keyed by resource hash hex.
@@ -3188,33 +3178,6 @@ class LXMRouter(
     // coroutines, ConcurrentHashMap) are used in place of Python locks.
 
     /**
-     * Allow an identity hash to invoke propagation-node control requests.
-     * Matches Python `allow_control()`.
-     *
-     * @param identityHash Truncated identity hash (16 bytes)
-     * @throws IllegalArgumentException if hash length is wrong
-     */
-    fun allowControl(identityHash: ByteArray) {
-        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
-            "Allowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
-        }
-        if (controlAllowedList.none { it.contentEquals(identityHash) }) {
-            controlAllowedList.add(identityHash)
-        }
-    }
-
-    /**
-     * Remove an identity hash from the control-allowed list.
-     * Matches Python `disallow_control()`.
-     */
-    fun disallowControl(identityHash: ByteArray) {
-        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
-            "Disallowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
-        }
-        controlAllowedList.removeAll { it.contentEquals(identityHash) }
-    }
-
-    /**
      * Drop incoming messages with invalid stamps. Matches Python `enforce_stamps()`:
      * enforcement flag is global and opt-in; default is to accept with a warning.
      */
@@ -3533,14 +3496,6 @@ class LXMRouter(
      * server-side propagation role (`enable_propagation`, P3) is not implemented;
      * clients never need to emit this payload.
      */
-    fun getPropagationNodeAppData(): ByteArray? = null
-
-    /**
-     * Router statistics snapshot. Matches Python `compile_stats()`: returns null
-     * when not running as a propagation node (client-only router).
-     */
-    fun compileStats(): Map<String, Any>? = null
-
     /**
      * Register JVM shutdown cleanup. Matches Python `exit_handler()`, which is
      * wired to SIGINT/SIGTERM handlers; on the JVM the idiom is a shutdown hook.
@@ -3875,23 +3830,6 @@ class LXMRouter(
      *  unhandled_peers, stamp_value]. The peer-tracking slots are P4 territory
      * and intentionally absent here (documented deviation).
      */
-    data class PropagationEntry(
-        val destinationHash: ByteArray,
-        val filePath: String,
-        val receivedSeconds: Long,
-        val sizeBytes: Long,
-        val stampValue: Int,
-    ) {
-        override fun equals(other: Any?): Boolean =
-            other is PropagationEntry &&
-                destinationHash.contentEquals(other.destinationHash) &&
-                filePath == other.filePath &&
-                receivedSeconds == other.receivedSeconds &&
-                sizeBytes == other.sizeBytes &&
-                stampValue == other.stampValue
-
-        override fun hashCode(): Int = filePath.hashCode()
-    }
 
     /** Compiled node statistics (subset reachable without LXMPeer — see compileStats). */
     data class NodeStats(
@@ -3917,9 +3855,6 @@ class LXMRouter(
     /** Directory holding the message store ({storagePath}/lxmf/messagestore). */
     private var messageStoreDir: File? = null
 
-    /** Stored propagation messages: transient_id_hex -> entry. */
-    private val propagationEntries = ConcurrentHashMap<String, PropagationEntry>()
-
     /** Inbound propagation destination (created by enablePropagation). */
     var propagationDestination: Destination? = null
         private set
@@ -3927,9 +3862,6 @@ class LXMRouter(
     /** Control destination for authenticated stats/peering requests. */
     var controlDestination: Destination? = null
         private set
-
-    /** Identities allowed to issue control requests (stats/peer sync). Hex strings. */
-    private val controlAllowedList = mutableListOf<String>()
 
     /** Maximum message store size in bytes; null = unlimited. */
     @Volatile
@@ -3973,9 +3905,6 @@ class LXMRouter(
 
     /** link_id_hex -> true once an offer presented a valid peering key. */
     private val validatedPeerLinks = ConcurrentHashMap<String, Boolean>()
-
-    /** remote_hash_hex -> throttle-until epoch seconds (invalid-stamp offenders). */
-    private val throttledPeers = ConcurrentHashMap<String, Long>()
 
     /** remote_hash_hex -> validation-started epoch seconds (sequential validation gate). */
     private val validatingPnStampsFrom = ConcurrentHashMap<String, Long>()
@@ -4049,10 +3978,10 @@ class LXMRouter(
                         if (data.size < LXMFConstants.DESTINATION_LENGTH) continue
                         propagationEntries[components[0]] =
                             PropagationEntry(
-                                destinationHash = data.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH),
+                                dstHash = data.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH),
                                 filePath = file.absolutePath,
-                                receivedSeconds = received,
-                                sizeBytes = data.size.toLong(),
+                                receivedAt = received.toDouble(),
+                                size = data.size,
                                 stampValue = stampValue,
                             )
                     } catch (e: Exception) {
@@ -4096,7 +4025,7 @@ class LXMRouter(
 
             // Control destination (self first in the allowed list).
             controlAllowedList.clear()
-            controlAllowedList.add(routerIdentity.hexHash)
+            controlAllowedList.add(routerIdentity.hash)
             val ctrlDest =
                 Destination.create(
                     identity = routerIdentity,
@@ -4112,7 +4041,7 @@ class LXMRouter(
                     encodeMsgpackValue(statsGetRequest(path, remoteIdentity))
                 },
                 allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
-                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+                allowedList = controlAllowedList,
             )
             // Peer sync/unpeer control requests authenticate identically, but the
             // peering table itself arrives with P4 (PEER-P4); until then any
@@ -4124,7 +4053,7 @@ class LXMRouter(
                     encodeMsgpackValue(peerSyncRequest(data, remoteIdentity))
                 },
                 allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
-                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+                allowedList = controlAllowedList,
             )
             ctrlDest.registerRequestHandler(
                 path = UNPEER_REQUEST_PATH,
@@ -4132,7 +4061,7 @@ class LXMRouter(
                     encodeMsgpackValue(peerUnpeerRequest(data, remoteIdentity))
                 },
                 allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
-                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+                allowedList = controlAllowedList,
             )
             Transport.registerDestination(ctrlDest)
             controlDestination = ctrlDest
@@ -4243,7 +4172,7 @@ class LXMRouter(
      */
     fun messageStorageSize(): Long? {
         if (!propagationNodeEnabled) return null
-        return propagationEntries.values.sumOf { it.sizeBytes }
+        return propagationEntries.values.sumOf { it.size.toLong() }
     }
 
     /** Set information (telemetry) store limit. Same units contract as [setMessageStorageLimit]. */
@@ -4284,10 +4213,10 @@ class LXMRouter(
      */
     internal fun getWeight(entry: PropagationEntry): Double {
         val now = System.currentTimeMillis() / 1000
-        val ageWeight = maxOf(1.0, (now - entry.receivedSeconds) / 60.0 / 60.0 / 24.0 / 4.0)
+        val ageWeight = maxOf(1.0, (now - entry.receivedAt) / 60.0 / 60.0 / 24.0 / 4.0)
         val priorityWeight =
-            if (prioritisedList.any { it.contentEquals(entry.destinationHash) }) 0.1 else 1.0
-        return priorityWeight * ageWeight * entry.sizeBytes
+            if (prioritisedList.any { it.contentEquals(entry.dstHash) }) 0.1 else 1.0
+        return priorityWeight * ageWeight * entry.size
     }
 
     /**
@@ -4299,7 +4228,7 @@ class LXMRouter(
         println("[LXMRouter] Cleaning message store")
         val dir = messageStoreDir
         val now = System.currentTimeMillis() / 1000
-        val removed = mutableListOf<Pair<String, String>>() // transientIdHex to filepath
+        val removed = mutableListOf<Pair<String, String?>>() // transientIdHex to filepath
 
         for ((transientIdHex, entry) in propagationEntries) {
             val name = File(entry.filePath).name
@@ -4310,11 +4239,11 @@ class LXMRouter(
                     components[0].length == RnsConstants.TRUNCATED_HASH_BYTES * 2 &&
                     components[2].toIntOrNull() == entry.stampValue
             if (validShape) {
-                if (now > entry.receivedSeconds + LXMFConstants.MESSAGE_EXPIRY) {
+                if (now > entry.receivedAt + LXMFConstants.MESSAGE_EXPIRY) {
                     removed.add(Pair(transientIdHex, entry.filePath))
                 }
             } else {
-                println("[LXMRouter] Purging message ${entry.filePath.takeLast(24)} due to invalid file path")
+                println("[LXMRouter] Purging message ${entry.filePath?.takeLast(24) ?: "<null>"} due to invalid file path")
                 removed.add(Pair(transientIdHex, entry.filePath))
             }
         }
@@ -4348,8 +4277,8 @@ class LXMRouter(
             try {
                 File(entry.filePath).delete()
                 propagationEntries.remove(transientIdHex)
-                bytesCleaned += entry.sizeBytes
-                println("[LXMRouter] Removed $transientIdHex with weight $weight to clear up ${entry.sizeBytes} bytes")
+                bytesCleaned += entry.size
+                println("[LXMRouter] Removed $transientIdHex with weight $weight to clear up ${entry.size} bytes")
             } catch (e: Exception) {
                 println("[LXMRouter] Error while cleaning LXMF message from store: ${e.message}")
             }
@@ -4396,8 +4325,8 @@ class LXMRouter(
                 // Listing mode: sizes ascending.
                 val available =
                     propagationEntries.entries
-                        .filter { it.value.destinationHash.toHexString() == remoteDestinationHashHex }
-                        .map { Pair(it.key, it.value.sizeBytes) }
+                        .filter { it.value.dstHash.toHexString() == remoteDestinationHashHex }
+                        .map { Pair(it.key, it.value.size.toLong()) }
                         .sortedBy { it.second }
                         .map { it.first }
                 return available.map { hexToBytes(it)!! }
@@ -4407,7 +4336,7 @@ class LXMRouter(
             haves?.forEach { transientId ->
                 val hex = transientId.toHexString()
                 val entry = propagationEntries[hex]
-                if (entry != null && entry.destinationHash.toHexString() == remoteDestinationHashHex) {
+                if (entry != null && entry.dstHash.toHexString() == remoteDestinationHashHex) {
                     try {
                         propagationEntries.remove(hex)
                         File(entry.filePath).delete()
@@ -4426,7 +4355,7 @@ class LXMRouter(
                 for (transientId in wants) {
                     val hex = transientId.toHexString()
                     val entry = propagationEntries[hex] ?: continue
-                    if (entry.destinationHash.toHexString() != remoteDestinationHashHex) continue
+                    if (entry.dstHash.toHexString() != remoteDestinationHashHex) continue
                     try {
                         val stamped = File(entry.filePath).readBytes()
                         val lxmSize = stamped.size
@@ -4562,7 +4491,7 @@ class LXMRouter(
         remoteIdentity: Identity?,
     ): Any? {
         if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
-        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        if (controlAllowedList.none { it.contentEquals(remoteIdentity.hash) }) return NodeErrors.ERROR_NO_ACCESS
         return compileStatsMap()
     }
 
@@ -4629,7 +4558,7 @@ class LXMRouter(
         remoteIdentity: Identity?,
     ): Any? {
         if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
-        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        if (controlAllowedList.none { it.contentEquals(remoteIdentity.hash) }) return NodeErrors.ERROR_NO_ACCESS
         if (data == null || data.size != RnsConstants.TRUNCATED_HASH_BYTES) return NodeErrors.ERROR_INVALID_DATA
         return NodeErrors.ERROR_NOT_FOUND // PEER-P4: no peers exist yet
     }
@@ -4640,7 +4569,7 @@ class LXMRouter(
         remoteIdentity: Identity?,
     ): Any? {
         if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
-        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        if (controlAllowedList.none { it.contentEquals(remoteIdentity.hash) }) return NodeErrors.ERROR_NO_ACCESS
         if (data == null || data.size != RnsConstants.TRUNCATED_HASH_BYTES) return NodeErrors.ERROR_INVALID_DATA
         return NodeErrors.ERROR_NOT_FOUND // PEER-P4: no peers exist yet
     }
@@ -4806,7 +4735,7 @@ class LXMRouter(
                                         res.link.teardown()
                                         if (remoteHashHex != null) {
                                             throttledPeers[remoteHashHex] =
-                                                System.currentTimeMillis() / 1000 + PN_STAMP_THROTTLE_SECONDS
+                                                (System.currentTimeMillis() / 1000 + PN_STAMP_THROTTLE_SECONDS).toDouble()
                                         }
                                         println("[LXMRouter] Propagation transfer contained $invalidCount invalid stamp(s); sender throttled")
                                     }
@@ -5022,10 +4951,10 @@ class LXMRouter(
 
                     propagationEntries[transientIdHex] =
                         PropagationEntry(
-                            destinationHash = destinationHash,
+                            dstHash = destinationHash,
                             filePath = filePath,
-                            receivedSeconds = System.currentTimeMillis() / 1000,
-                            sizeBytes = stampedData.size.toLong(),
+                            receivedAt = (System.currentTimeMillis() / 1000).toDouble(),
+                            size = stampedData.size,
                             stampValue = stampValue ?: 0,
                         )
                     // PEER-P4: Python enqueues into peer distribution queues here.
@@ -5268,12 +5197,6 @@ class LXMRouter(
         }
     }
 
-    /** Expire throttle entries (Python clean_throttled_peers). */
-    fun cleanThrottledPeers() {
-        val now = System.currentTimeMillis() / 1000
-        throttledPeers.entries.removeIf { now > it.value }
-    }
-
     /**
      * Flush queued distributions to peers. PEER-P4: with no peer table the
      * queue is definitionally empty; kept as an explicit no-op so the job
@@ -5424,9 +5347,6 @@ class LXMRouter(
 
     /** Identity hashes allowed to issue control requests (Python control_allowed_list) */
     private val controlAllowedList = mutableListOf<ByteArray>()
-
-    /** Maximum accepted peering cost (Python max_peering_cost). */
-    var maxPeeringCost: Int = LXMFConstants.MAX_PEERING_COST
 
     /** Maximum number of concurrent peers (Python max_peers; default MAX_PEERS=20). */
     var maxPeers: Int = MAX_PEERS
@@ -5791,7 +5711,7 @@ class LXMRouter(
     fun cleanThrottledPeers() {
         val now = nowSecondsDouble()
         val expired = throttledPeers.entries.filter { now > it.value }.map { it.key }
-        for (key in expired) throttledPeers.remove(key)
+        for (key in expired) throttledPeers.remove(key as String)
     }
 
     /**

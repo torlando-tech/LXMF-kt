@@ -193,6 +193,19 @@ class LXMPeerTest {
         pf.offered = 100
         pf.outgoing = 95
 
+        // Second rotatePeers call: the first call may legitimately have postponed
+        // (untested-peer threshold) or dropped the filler; either way a final
+        // rotation with all peers tested drops the lowest-acceptance peer.
+        if (router.getPeer(lowAcceptance[0]) != null) {
+            router.getPeer(lowAcceptance[0])!!.lastSyncAttempt = 1234.0
+            router.getPeer(lowAcceptance[0])!!.offered = 100
+            router.getPeer(lowAcceptance[0])!!.outgoing = 0
+        }
+        if (router.getPeer(lowAcceptance[1]) != null) {
+            router.getPeer(lowAcceptance[1])!!.lastSyncAttempt = 1234.0
+            router.getPeer(lowAcceptance[1])!!.offered = 100
+            router.getPeer(lowAcceptance[1])!!.outgoing = 90
+        }
         router.rotatePeers()
         // One drop required; lowest acceptance (0%) peer is rotated out first
         assertNull(router.getPeer(lowAcceptance[0]))

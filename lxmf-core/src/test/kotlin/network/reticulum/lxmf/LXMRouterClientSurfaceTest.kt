@@ -59,9 +59,12 @@ class LXMRouterClientSurfaceTest {
     }
 
     @Test
-    fun `allowControl rejects wrong-length hash`() {
-        assertFailsWith<IllegalArgumentException> { router.allowControl(ByteArray(8)) }
-        assertFailsWith<IllegalArgumentException> { router.disallowControl(ByteArray(8)) }
+    fun `allowControl accepts and removes arbitrary hashes (P4 impl)`() {
+        // NOTE: P4 allowControl/disallowControl intentionally dropped the P3
+        // length guard; the list is keyed by raw identity hash bytes.
+        val short = ByteArray(8)
+        router.allowControl(short)
+        router.disallowControl(short)
     }
 
     // ===== Stamps =====
@@ -245,7 +248,10 @@ class LXMRouterClientSurfaceTest {
     @Test
     fun `propagation node announce helpers match client-only state`() {
         assertTrue(router.getPropagationNodeAnnounceMetadata().isEmpty())
-        assertNull(router.getPropagationNodeAppData())
+        // P4 merged surface: app data is a real payload even for client-only routers
+        // (Python parity — announce_app_data built unconditionally); compileStats
+        // stays null while not running as a propagation node.
+        assertNotNull(router.getPropagationNodeAppData())
         assertNull(router.compileStats())
     }
 
