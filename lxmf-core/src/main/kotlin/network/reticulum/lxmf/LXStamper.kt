@@ -22,6 +22,9 @@ object LXStamper {
     /** Workblock expansion rounds for propagation node stamps */
     const val WORKBLOCK_EXPAND_ROUNDS_PN = 1000
 
+    /** Workblock expansion rounds for peering key generation (Python WORKBLOCK_EXPAND_ROUNDS_PEERING) */
+    const val WORKBLOCK_EXPAND_ROUNDS_PEERING = 25
+
     /** HKDF output length per round */
     const val HKDF_OUTPUT_LENGTH = Stamper.HKDF_OUTPUT_LENGTH
 

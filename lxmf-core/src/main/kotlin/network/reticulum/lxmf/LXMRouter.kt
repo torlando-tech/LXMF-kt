@@ -106,6 +106,22 @@ class LXMRouter(
         const val JOB_RESOURCE_INTERVAL_TICKS = 2L
         const val JOB_STORE_INTERVAL_TICKS = 120L
         const val JOB_PEERSYNC_INTERVAL_TICKS = 6L
+
+        // ===== Peer synchronisation constants (Python LXMRouter class attributes) =====
+
+        /** Number of fastest peers used to seed the random sync pool (Python FASTEST_N_RANDOM_POOL). */
+        const val FASTEST_N_RANDOM_POOL = 2
+
+        /** Percentage of max peers kept as rotation headroom (Python ROTATION_HEADROOM_PCT). */
+        const val ROTATION_HEADROOM_PCT = 10
+
+        /** Maximum acceptance rate below which a peer becomes a rotation candidate (Python ROTATION_AR_MAX). */
+        const val ROTATION_AR_MAX = 0.5
+
+        /** Sync postponement applied when the remote indicates we are throttled (Python PN_STAMP_THROTTLE, seconds). */
+        const val PN_STAMP_THROTTLE = 180
+
+>>>>>>> 768bb9f3d6ee5178f14aaa92d56578a60d390fe2
     }
 
     // ===== Message Queues =====
@@ -5351,4 +5367,457 @@ class LXMRouter(
                 0L
             }
         }
+
+    // ===== Peer Synchronisation (Python LXMRouter/LXMPeer integration points) =====
+    //
+    // Ported from Python LXMRouter.py peer-management methods (LXMF 1.1.0):
+    //   peer(), unpeer(), rotate_peers(), sync_peers(),
+    //   enqueue_peer_distribution(), flush_peer_distribution_queue(),
+    //   peer_sync_request(), peer_unpeer_request(), clean_throttled_peers()
+    // plus the propagation_entries message store those methods operate on.
+    //
+    // Companion constants mirrored from Python LXMRouter class attributes:
+    // FASTEST_N_RANDOM_POOL=2, ROTATION_HEADROOM_PCT=10, ROTATION_AR_MAX=0.5,
+    // PN_STAMP_THROTTLE=180.
+
+    // ===== Peer Synchronisation (Python LXMRouter peer-management integration points) =====
+    //
+    // Ported from Python LXMRouter.py (LXMF 1.1.0):
+    //   peer(), unpeer(), rotate_peers(), sync_peers(),
+    //   enqueue_peer_distribution(), flush_peer_distribution_queue(),
+    //   peer_sync_request(), peer_unpeer_request(), clean_throttled_peers()
+    // plus the propagation_entries message store those methods operate on.
+
+    /**
+     * One entry in the propagation node's local message store
+     * (Python `propagation_entries[transient_id]`, a fixed-index list).
+     * Field mapping: [0]=destination_hash → dstHash, [1]=filepath → filePath,
+     * [2]=received_at → receivedAt, [3]=size → size, [4]=handled-by list → handledBy,
+     * [5]=unhandled-by list → unhandledBy, [6]=stamp_value → stampValue.
+     */
+    data class PropagationEntry(
+        val dstHash: ByteArray,
+        var filePath: String?,
+        val receivedAt: Double,
+        val size: Int,
+        /** Peers that have this message (Python entry slot [4]) */
+        val handledBy: MutableList<ByteArray> = mutableListOf(),
+        /** Peers that do not yet have this message (Python entry slot [5]) */
+        val unhandledBy: MutableList<ByteArray> = mutableListOf(),
+        var stampValue: Int = 0,
+    )
+
+    /** Known peers: destination_hash (hex) -> LXMPeer */
+    private val peers = ConcurrentHashMap<String, LXMPeer>()
+
+    /** Static (manually configured) peers that are never culled or rotated (hex hashes) */
+    private val staticPeers = mutableListOf<String>()
+
+    /** Propagation message store: transient_id (hex) -> PropagationEntry */
+    private val propagationEntries = ConcurrentHashMap<String, PropagationEntry>()
+
+    /** Queue of messages to distribute to all other peers on next flush */
+    private val peerDistributionQueue = ArrayDeque<Pair<ByteArray, String>>()
+
+    /** Peers recently indicated as throttling us, with expiry timestamps */
+    private val throttledPeers = ConcurrentHashMap<String, Double>()
+
+    /** Identity hashes allowed to issue control requests (Python control_allowed_list) */
+    private val controlAllowedList = mutableListOf<ByteArray>()
+
+    /** Maximum accepted peering cost (Python max_peering_cost). */
+    var maxPeeringCost: Int = LXMFConstants.MAX_PEERING_COST
+
+    /** Maximum number of concurrent peers (Python max_peers; default MAX_PEERS=20). */
+    var maxPeers: Int = MAX_PEERS
+
+    /** Default sync strategy for newly created peers. */
+    var defaultSyncStrategy: Int = LXMPeer.DEFAULT_SYNC_STRATEGY
+
+    /** Python prioritise_rotating_unreachable_peers flag. */
+    var prioritiseRotatingUnreachablePeers: Boolean = false
+
+    /** Expose the propagation entries map for LXMPeer access. */
+    val propagationEntriesMap: ConcurrentHashMap<String, PropagationEntry>
+        get() = propagationEntries
+
+    /** The router identity, if configured (used for peering-key generation / link identify). */
+    internal fun identityOrNull(): Identity? = identity
+
+    // ---- Message store accessors (parity with Python get_size/get_weight/get_stamp_value) ----
+
+    fun getSize(transientId: ByteArray): Int =
+        propagationEntries[transientId.toHexString()]?.size ?: 0
+
+    fun getWeight(transientId: ByteArray): Double {
+        val entry = propagationEntries[transientId.toHexString()] ?: return 0.0
+        val now = nowSecondsDouble()
+        val ageWeight = maxOf(1.0, (now - entry.receivedAt) / 60 / 60 / 24 / 4)
+        val priorityWeight = if (prioritisedList.any { it.contentEquals(entry.dstHash) }) 0.1 else 1.0
+        return priorityWeight * ageWeight * entry.size
+    }
+
+    fun getStampValue(transientId: ByteArray): Int? =
+        propagationEntries[transientId.toHexString()]?.stampValue
+
+    private fun nowSecondsDouble(): Double = System.currentTimeMillis() / 1000.0
+
+    // ---- Peering lifecycle ----
+
+    /**
+     * Register/update peering state from an announce.
+     * Matches Python LXMRouter.peer() (lines 2004-2047), including the
+     * timebase-guarded update path and the max-peers admission check.
+     */
+    @Synchronized
+    fun peer(
+        destinationHash: ByteArray,
+        timestamp: Double,
+        propagationTransferLimit: Double?,
+        propagationSyncLimit: Double?,
+        propagationStampCost: Int?,
+        propagationStampCostFlexibility: Int?,
+        peeringCost: Int,
+        metadata: Map<*, *>?,
+    ) {
+        val hex = destinationHash.toHexString()
+        if (peeringCost > maxPeeringCost) {
+            if (peers.containsKey(hex)) {
+                println("[LXMRouter] Peer ${prettyHexRep(destinationHash)} increased peering cost beyond local accepted maximum, breaking peering...")
+                unpeer(destinationHash, timestamp)
+            } else {
+                println("[LXMRouter] Not peering with ${prettyHexRep(destinationHash)}, since its peering cost of $peeringCost exceeds local maximum of $maxPeeringCost")
+            }
+        } else {
+            val existing = peers[hex]
+            if (existing != null) {
+                if (timestamp > existing.peeringTimebase) {
+                    existing.alive = true
+                    existing.metadata = metadata
+                    existing.syncBackoff = 0
+                    existing.nextSyncAttempt = 0.0
+                    existing.peeringTimebase = timestamp
+                    existing.lastHeard = nowSecondsDouble()
+                    existing.propagationStampCost = propagationStampCost
+                    existing.propagationStampCostFlexibility = propagationStampCostFlexibility
+                    existing.peeringCost = peeringCost
+                    existing.propagationTransferLimit = propagationTransferLimit
+                    existing.propagationSyncLimit =
+                        if (propagationSyncLimit != null) propagationSyncLimit else propagationTransferLimit
+                    println("[LXMRouter] Peering config updated for ${prettyHexRep(destinationHash)}")
+                }
+            } else {
+                if (peers.size >= maxPeers) {
+                    println("[LXMRouter] Max peers reached, not peering with ${prettyHexRep(destinationHash)}")
+                } else {
+                    val newPeer = LXMPeer(this, destinationHash, syncStrategy = defaultSyncStrategy)
+                    newPeer.alive = true
+                    newPeer.metadata = metadata
+                    newPeer.lastHeard = nowSecondsDouble()
+                    newPeer.peeringTimebase = timestamp
+                    newPeer.propagationStampCost = propagationStampCost
+                    newPeer.propagationStampCostFlexibility = propagationStampCostFlexibility
+                    newPeer.peeringCost = peeringCost
+                    newPeer.propagationTransferLimit = propagationTransferLimit
+                    newPeer.propagationSyncLimit =
+                        if (propagationSyncLimit != null) propagationSyncLimit else propagationTransferLimit
+                    peers[hex] = newPeer
+                    println("[LXMRouter] Peered with ${prettyHexRep(destinationHash)}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Break peering with a peer. Matches Python LXMRouter.unpeer() (lines 2049-2058),
+     * including the timebase guard that rejects stale unpeer requests.
+     */
+    @Synchronized
+    fun unpeer(destinationHash: ByteArray, timestamp: Double = nowSecondsDouble()): Boolean {
+        val hex = destinationHash.toHexString()
+        val peer = peers[hex] ?: return false
+        return if (timestamp >= peer.peeringTimebase) {
+            peers.remove(hex)
+            println("[LXMRouter] Broke peering with $peer")
+            true
+        } else {
+            false
+        }
+    }
+
+    /**
+     * Rotate out low-acceptance-rate peers to keep peering headroom.
+     * Matches Python LXMRouter.rotate_peers() (lines 2060-2128): headroom math,
+     * untested-peer postponement, fully-synced pool preference, drop-pool
+     * selection and acceptance-rate-based culling. Static peers are never rotated.
+     */
+    fun rotatePeers() {
+        try {
+            val rotationHeadroom = maxOf(1, Math.floor(maxPeers * (ROTATION_HEADROOM_PCT / 100.0)).toInt())
+            val requiredDrops = peers.size - (maxPeers - rotationHeadroom)
+            if (requiredDrops > 0 && peers.size - requiredDrops > 1) {
+                var candidatePool: Map<String, LXMPeer> = peers.toMap()
+
+                val untestedPeers = candidatePool.values.filter { it.lastSyncAttempt == 0.0 }
+                if (untestedPeers.size >= rotationHeadroom) {
+                    println("[LXMRouter] Newly added peer threshold reached, postponing peer rotation")
+                    return
+                }
+
+                val fullySyncedPeers = candidatePool.filterValues { it.unhandledMessageCount == 0 }
+                if (fullySyncedPeers.isNotEmpty()) {
+                    candidatePool = fullySyncedPeers
+                    println("[LXMRouter] Found ${fullySyncedPeers.size} fully synced peer${if (fullySyncedPeers.size == 1) "" else "s"}, using as peer rotation pool basis")
+                }
+
+                val waitingPeers = mutableListOf<LXMPeer>()
+                val unresponsivePeers = mutableListOf<LXMPeer>()
+                for ((id, p) in candidatePool) {
+                    if (!staticPeers.contains(id) && p.state == LXMPeer.IDLE) {
+                        if (p.alive) {
+                            if (p.offered == 0) {
+                                // Don't consider for unpeering until at least one message has been offered
+                            } else {
+                                waitingPeers.add(p)
+                            }
+                        } else {
+                            unresponsivePeers.add(p)
+                        }
+                    }
+                }
+
+                val dropPool = mutableListOf<LXMPeer>()
+                if (unresponsivePeers.isNotEmpty()) {
+                    dropPool.addAll(unresponsivePeers)
+                    if (!prioritiseRotatingUnreachablePeers) dropPool.addAll(waitingPeers)
+                } else {
+                    dropPool.addAll(waitingPeers)
+                }
+
+                if (dropPool.isNotEmpty()) {
+                    val dropCount = minOf(requiredDrops, dropPool.size)
+                    val lowAcceptanceRatePeers = dropPool
+                        .sortedBy { if (it.offered == 0) 0.0 else it.outgoing.toDouble() / it.offered.toDouble() }
+                        .take(dropCount)
+
+                    var droppedPeers = 0
+                    for (p in lowAcceptanceRatePeers) {
+                        val ar = if (p.offered == 0) 0.0 else
+                            Math.round((p.outgoing.toDouble() / p.offered.toDouble()) * 100 * 100) / 100.0
+                        if (ar < ROTATION_AR_MAX * 100) {
+                            val reachableStr = if (p.alive) "reachable" else "unreachable"
+                            println("[LXMRouter] Acceptance rate for $reachableStr peer ${prettyHexRep(p.destinationHash)} was: $ar% (${p.outgoing}/${p.offered}, ${p.unhandledMessageCount} unhandled messages)")
+                            unpeer(p.destinationHash)
+                            droppedPeers += 1
+                        }
+                    }
+
+                    val ms = if (droppedPeers == 1) "" else "s"
+                    println("[LXMRouter] Dropped $droppedPeers low acceptance rate peer$ms to increase peering headroom")
+                }
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] An error occurred during peer rotation: $e")
+        }
+    }
+
+    /**
+     * Select and initiate sync with a suitable peer.
+     * Matches Python LXMRouter.sync_peers() (lines 2130-2185): unreachable-peer
+     * culling, alive/unresponsive bucketing, fastest-N random pool selection.
+     */
+    fun syncPeers() {
+        val culledPeers = mutableListOf<String>()
+        val waitingPeers = mutableListOf<LXMPeer>()
+        val unresponsivePeers = mutableListOf<LXMPeer>()
+        val snapshot = peers.toMap()
+        val now = nowSecondsDouble()
+
+        for ((peerId, peer) in snapshot) {
+            if (now > peer.lastHeard + LXMPeer.MAX_UNREACHABLE) {
+                if (!staticPeers.contains(peerId)) culledPeers.add(peerId)
+            } else {
+                if (peer.state == LXMPeer.IDLE && peer.unhandledMessages.isNotEmpty()) {
+                    if (peer.alive) {
+                        waitingPeers.add(peer)
+                    } else if (now > peer.nextSyncAttempt) {
+                        unresponsivePeers.add(peer)
+                    }
+                }
+            }
+        }
+
+        val peerPool = mutableListOf<LXMPeer>()
+        if (waitingPeers.isNotEmpty()) {
+            val fastestPeers = waitingPeers
+                .sortedByDescending { it.syncTransferRate }
+                .take(minOf(FASTEST_N_RANDOM_POOL, waitingPeers.size))
+            peerPool.addAll(fastestPeers)
+
+            val unknownSpeedPeers = waitingPeers.filter { it.syncTransferRate == 0.0 }
+            if (unknownSpeedPeers.isNotEmpty()) {
+                peerPool.addAll(unknownSpeedPeers.take(minOf(unknownSpeedPeers.size, fastestPeers.size)))
+            }
+
+            println("[LXMRouter] Selecting peer to sync from ${waitingPeers.size} waiting peers.")
+        } else if (unresponsivePeers.isNotEmpty()) {
+            println("[LXMRouter] No active peers available, randomly selecting peer to sync from ${unresponsivePeers.size} unresponsive peers.")
+            peerPool.addAll(unresponsivePeers)
+        }
+
+        if (peerPool.isNotEmpty()) {
+            val selectedIndex = java.util.concurrent.ThreadLocalRandom.current().nextInt(peerPool.size)
+            val selectedPeer = peerPool[selectedIndex]
+            println("[LXMRouter] Selected waiting peer $selectedIndex: ${prettyHexRep(selectedPeer.destinationHash)}")
+            selectedPeer.sync()
+        }
+
+        for (peerId in culledPeers) {
+            println("[LXMRouter] Removing peer $peerId due to excessive unreachability")
+            try {
+                peers.remove(peerId)
+            } catch (e: Exception) {
+                println("[LXMRouter] Error while removing peer $peerId. The contained exception was: $e")
+            }
+        }
+    }
+
+    // ---- Distribution queue ----
+
+    /**
+     * Queue a newly received message for distribution to all other peers.
+     * Matches Python enqueue_peer_distribution() (line 2469).
+     */
+    fun enqueuePeerDistribution(transientId: ByteArray, fromPeerHex: String?) {
+        peerDistributionQueue.addLast(Pair(transientId, fromPeerHex ?: ""))
+    }
+
+    /**
+     * Flush the distribution queue into per-peer queues.
+     * Matches Python flush_peer_distribution_queue() (lines 2472-2486):
+     * every peer except the originating peer receives the message as unhandled.
+     */
+    fun flushPeerDistributionQueue() {
+        if (peerDistributionQueue.isNotEmpty()) {
+            val entries = mutableListOf<Pair<ByteArray, String>>()
+            while (peerDistributionQueue.isNotEmpty()) {
+                entries.add(peerDistributionQueue.removeLast())
+            }
+
+            for ((_, peer) in peers) {
+                for ((transientId, fromPeer) in entries) {
+                    if (peer.destinationHash.toHexString() != fromPeer) {
+                        peer.queueUnhandledMessage(transientId)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Process queued distributions for all peers (Python flush_queues' peer half).
+     */
+    fun flushQueuesForPeers() {
+        if (peers.isNotEmpty()) {
+            flushPeerDistributionQueue()
+            for ((_, peer) in peers) {
+                if (peer.queuedItems()) peer.processQueues()
+            }
+        }
+    }
+
+    // ---- Control request handlers (Python peer_sync_request/peer_unpeer_request) ----
+
+    /**
+     * Handle an authenticated remote sync request.
+     * Matches Python peer_sync_request() (lines 843-853) including the strict
+     * identity/access/data-length validation chain — trust-bearing checks kept exact:
+     * no identity → ERROR_NO_IDENTITY; not allow-listed → ERROR_NO_ACCESS;
+     * non-16-byte payload → ERROR_INVALID_DATA; unknown peer → ERROR_NOT_FOUND.
+     */
+    fun peerSyncRequest(path: String, data: ByteArray?, remoteIdentity: Identity?): Any {
+        val truncatedHashBytes = RnsConstants.TRUNCATED_HASH_BYTES
+        return when {
+            remoteIdentity == null -> LXMPeer.ERROR_NO_IDENTITY
+            !controlAllowedList.any { it.contentEquals(remoteIdentity.hash) } -> LXMPeer.ERROR_NO_ACCESS
+            data == null || data.size != truncatedHashBytes -> LXMPeer.ERROR_INVALID_DATA
+            else -> {
+                val peer = peers[data.toHexString()] ?: return LXMPeer.ERROR_NOT_FOUND
+                peer.sync()
+                true
+            }
+        }
+    }
+
+    /**
+     * Handle an authenticated remote unpeer request.
+     * Matches Python peer_unpeer_request() (lines 855-863) with the same validation chain.
+     */
+    fun peerUnpeerRequest(path: String, data: ByteArray?, remoteIdentity: Identity?): Any {
+        val truncatedHashBytes = RnsConstants.TRUNCATED_HASH_BYTES
+        return when {
+            remoteIdentity == null -> LXMPeer.ERROR_NO_IDENTITY
+            !controlAllowedList.any { it.contentEquals(remoteIdentity.hash) } -> LXMPeer.ERROR_NO_ACCESS
+            data == null || data.size != truncatedHashBytes -> LXMPeer.ERROR_INVALID_DATA
+            else -> {
+                if (!peers.containsKey(data.toHexString())) return LXMPeer.ERROR_NOT_FOUND
+                unpeer(data)
+                true
+            }
+        }
+    }
+
+    /**
+     * Add an identity hash to the control-allowed list (Python allow_control()).
+     */
+    fun allowControl(identityHash: ByteArray) {
+        if (controlAllowedList.none { it.contentEquals(identityHash) }) {
+            controlAllowedList.add(identityHash.copyOf())
+        }
+    }
+
+    /**
+     * Remove an identity hash from the control-allowed list (Python disallow_control()).
+     */
+    fun disallowControl(identityHash: ByteArray) {
+        controlAllowedList.removeAll { it.contentEquals(identityHash) }
+    }
+
+    // ---- Maintenance ----
+
+    /**
+     * Remove expired throttle markers. Matches Python clean_throttled_peers() (lines 1136-1141).
+     */
+    fun cleanThrottledPeers() {
+        val now = nowSecondsDouble()
+        val expired = throttledPeers.entries.filter { now > it.value }.map { it.key }
+        for (key in expired) throttledPeers.remove(key)
+    }
+
+    /**
+     * Add a static peer (never culled by syncPeers/rotatePeers).
+     */
+    fun addStaticPeer(destHashHex: String) {
+        if (!staticPeers.contains(destHashHex)) staticPeers.add(destHashHex)
+        if (!peers.containsKey(destHashHex)) {
+            val hash = destHashHex.hexToBytesCompat()
+            peers[destHashHex] = LXMPeer(this, hash, syncStrategy = defaultSyncStrategy)
+        }
+    }
+
+    /**
+     * Get the current peer set.
+     */
+    fun getPeers(): List<LXMPeer> = peers.values.toList()
+
+    /**
+     * Get a peer by destination hash (raw bytes).
+     */
+    fun getPeer(destinationHash: ByteArray): LXMPeer? = peers[destinationHash.toHexString()]
+
+    private fun prettyHexRep(bytes: ByteArray): String = bytes.joinToString(":") { "%02x".format(it) }
+
+    private fun String.hexToBytesCompat(): ByteArray = chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    /** Unpack a msgpack value as Long, tolerating float encoding. */
 }
