@@ -273,6 +273,29 @@ class LXMRouter(
     /** Whether authentication is required for message delivery */
     private var authRequired: Boolean = false
 
+    /** Identity hashes allowed to invoke propagation-node control requests (Python `control_allowed_list`) */
+    private val controlAllowedList = mutableListOf<ByteArray>()
+
+    /**
+     * Whether invalid-stamp messages are dropped (true) or accepted with a warning (false).
+     * Python `_enforce_stamps`; default false — enforcement is opt-in.
+     */
+    @Volatile private var enforceStampsFlag: Boolean = false
+
+    /**
+     * Whether LXMs already synced from the active propagation node should be retained
+     * on the node after download (Python `retain_synced_on_node`).
+     */
+    @Volatile private var retainSyncedOnNode: Boolean = false
+
+    /**
+     * Incoming delivery resources still in flight, keyed by resource hash hex.
+     * Backs [inboundCount] / [inboundResources] / [cancelInbound] / [cancelAllInbound]
+     * (Python `incoming_delivery_resources` + lock). Registration happens in
+     * [handleResourceConcluded]'s sibling callback [onIncomingResourceStarted].
+     */
+    private val incomingDeliveryResources = ConcurrentHashMap<String, Resource>()
+
     // ===== Cleanup Tracking =====
 
     /** Processing loop counter for scheduling periodic cleanup */
@@ -1095,13 +1118,29 @@ class LXMRouter(
             true
         }
 
-        link.setResourceStartedCallback { _: Any ->
+        link.setResourceStartedCallback { resource: Any ->
             println("Resource transfer started on link to $destHashHex")
+            (resource as? Resource)?.let { registerIncomingResource(it) }
         }
 
         link.setResourceConcludedCallback { resource: Any ->
             handleResourceConcluded(resource, link)
+            (resource as? Resource)?.let { unregisterIncomingResource(it) }
         }
+    }
+
+    /**
+     * Track an incoming delivery resource while it is in flight so the
+     * client can observe/cancel it ([inboundCount], [inboundResources],
+     * [cancelInbound], [cancelAllInbound]). Mirrors Python's
+     * `incoming_delivery_resources` registration in delivery_link_established.
+     */
+    private fun registerIncomingResource(resource: Resource) {
+        incomingDeliveryResources[resource.hash.toHexString()] = resource
+    }
+
+    private fun unregisterIncomingResource(resource: Resource) {
+        incomingDeliveryResources.remove(resource.hash.toHexString())
     }
 
     /**
@@ -1462,8 +1501,13 @@ class LXMRouter(
             true
         }
 
+        link.setResourceStartedCallback { resource: Any ->
+            (resource as? Resource)?.let { registerIncomingResource(it) }
+        }
+
         link.setResourceConcludedCallback { resource: Any ->
             handleResourceConcluded(resource, link)
+            (resource as? Resource)?.let { unregisterIncomingResource(it) }
         }
 
         // Set up callback for when the remote peer identifies themselves
@@ -3121,6 +3165,378 @@ class LXMRouter(
         } else {
             true
         }
+
+    // ===== Client Surface Parity (P2) =====
+    // Methods below bring the client-facing LXMRouter surface to semantic
+    // parity with Python LXMF's LXMRouter.py. Kotlin idioms (properties,
+    // coroutines, ConcurrentHashMap) are used in place of Python locks.
+
+    /**
+     * Allow an identity hash to invoke propagation-node control requests.
+     * Matches Python `allow_control()`.
+     *
+     * @param identityHash Truncated identity hash (16 bytes)
+     * @throws IllegalArgumentException if hash length is wrong
+     */
+    fun allowControl(identityHash: ByteArray) {
+        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Allowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        if (controlAllowedList.none { it.contentEquals(identityHash) }) {
+            controlAllowedList.add(identityHash)
+        }
+    }
+
+    /**
+     * Remove an identity hash from the control-allowed list.
+     * Matches Python `disallow_control()`.
+     */
+    fun disallowControl(identityHash: ByteArray) {
+        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Disallowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        controlAllowedList.removeAll { it.contentEquals(identityHash) }
+    }
+
+    /**
+     * Drop incoming messages with invalid stamps. Matches Python `enforce_stamps()`:
+     * enforcement flag is global and opt-in; default is to accept with a warning.
+     */
+    fun enforceStamps() {
+        enforceStampsFlag = true
+    }
+
+    /**
+     * Accept incoming messages with invalid stamps (with a warning).
+     * Matches Python `ignore_stamps()`.
+     */
+    fun ignoreStamps() {
+        enforceStampsFlag = false
+    }
+
+    /** Current stamp-enforcement state (Python reads `_enforce_stamps` directly). */
+    fun stampsEnforced(): Boolean = enforceStampsFlag
+
+    /**
+     * Whether already-synced LXMs should be retained on the propagation node
+     * after download. Matches Python `set_retain_node_lxms()`.
+     */
+    fun setRetainNodeLxms(retain: Boolean) {
+        retainSyncedOnNode = retain
+    }
+
+    /** Current retain-on-node setting. */
+    fun getRetainNodeLxms(): Boolean = retainSyncedOnNode
+
+    /**
+     * Get the cached outbound stamp cost for a destination.
+     * Matches Python `get_outbound_stamp_cost()`.
+     *
+     * @param destHashHex Hex-encoded destination hash
+     * @return The last announced stamp cost, or null if unknown
+     */
+    fun getOutboundStampCost(destHashHex: String): Int? = outboundStampCosts[destHashHex]?.second
+
+    /**
+     * Get the expiry timestamp of the outbound ticket for a destination.
+     * Matches Python `get_outbound_ticket_expiry()`.
+     *
+     * @param destHashHex Hex-encoded destination hash
+     * @return Unix-seconds expiry, or null if no unexpired ticket exists
+     */
+    fun getOutboundTicketExpiry(destHashHex: String): Long? {
+        val entry = outboundTickets[destHashHex] ?: return null
+        val nowSeconds = System.currentTimeMillis() / 1000
+        return if (entry.first > nowSeconds) entry.first else null
+    }
+
+    /**
+     * Reload available tickets from storage, replacing the in-memory maps.
+     * Matches Python `reload_available_tickets()`; delegates to the same
+     * loader used at boot, which recreates missing sections empty.
+     */
+    fun reloadAvailableTickets() {
+        println("[LXMRouter] Reloading available tickets from storage")
+        loadAvailableTickets()
+    }
+
+    /**
+     * Get valid (unexpired) inbound tickets for a source.
+     * Public wrapper over the internal lookup used by stamp validation.
+     * Matches Python `get_inbound_tickets()` — returns null when none are valid.
+     */
+    fun getPublicInboundTickets(sourceHashHex: String): List<ByteArray>? = getInboundTickets(sourceHashHex)
+
+    /**
+     * Delivery progress (0.0–1.0) for an outbound message by its hash.
+     * Checks both the outbound queue and deferred-stamp queue.
+     * Matches Python `get_outbound_progress()`.
+     *
+     * @param lxmHashHex Hex-encoded message hash
+     * @return Progress value, or null if the message is not pending
+     */
+    suspend fun getOutboundProgress(lxmHashHex: String): Double? {
+        pendingOutboundMutex.withLock {
+            for (message in pendingOutbound) {
+                if (message.hash?.toHexString() == lxmHashHex) return message.progress
+            }
+        }
+        for ((_, message) in pendingDeferredStamps) {
+            if (message.hash?.toHexString() == lxmHashHex) return message.progress
+        }
+        return null
+    }
+
+    /**
+     * Effective per-message stamp cost for a pending outbound message.
+     * Returns null when an outbound ticket bypasses the stamp.
+     * Matches Python `get_outbound_lxm_stamp_cost()`.
+     */
+    fun getOutboundLxmStampCost(lxmHashHex: String): Int? {
+        pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
+            return if (message.outboundTicket != null) null else message.stampCost
+        }
+        pendingDeferredStamps.values.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
+            return if (message.outboundTicket != null) null else message.stampCost
+        }
+        return null
+    }
+
+    /**
+     * Propagation target stamp cost for a pending outbound message.
+     * Matches Python `get_outbound_lxm_propagation_stamp_cost()`. The Kotlin
+     * LXMessage does not track `propagation_target_cost`; the effective target
+     * is derived from the active node via [getOutboundPropagationCost].
+     */
+    fun getOutboundLxmPropagationStampCost(lxmHashHex: String): Int? {
+        val pending =
+            pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex } != null ||
+                pendingDeferredStamps.values.any { it.hash?.toHexString() == lxmHashHex }
+        return if (pending) getOutboundPropagationCost() else null
+    }
+
+    /**
+     * Whether a message with this transient ID has been locally delivered.
+     * Matches Python `has_message()`.
+     */
+    fun hasMessage(transientIdHex: String): Boolean = locallyDeliveredTransientIds.containsKey(transientIdHex)
+
+    /**
+     * Number of inbound resource transfers still in flight.
+     * Matches Python `inbound_count()`.
+     */
+    fun inboundCount(): Int =
+        try {
+            incomingDeliveryResources.values.count { it.status < ResourceConstants.COMPLETE }
+        } catch (e: Exception) {
+            println("[LXMRouter] Error while getting inbound resource transfer count: ${e.message}")
+            0
+        }
+
+    /**
+     * Inbound resource transfers still in flight.
+     * Matches Python `inbound_resources()`.
+     */
+    fun inboundResources(): List<Resource> =
+        incomingDeliveryResources.values.filter { it.status < ResourceConstants.COMPLETE }
+
+    /**
+     * Cancel one inbound resource transfer by hash.
+     * Matches Python `cancel_inbound()`: fails when the resource is unknown or
+     * already concluded.
+     *
+     * @param resourceHashHex Hex-encoded resource hash
+     * @return True when cancelled
+     */
+    fun cancelInbound(resourceHashHex: String): Boolean {
+        val resource = incomingDeliveryResources[resourceHashHex]
+        if (resource == null) {
+            println("[LXMRouter] Resource $resourceHashHex not found, cannot cancel")
+            return false
+        }
+        return if (resource.status < ResourceConstants.COMPLETE) {
+            resource.cancel()
+            println("[LXMRouter] Cancelled incoming delivery resource $resourceHashHex")
+            true
+        } else {
+            println("[LXMRouter] Incoming delivery resource $resourceHashHex already concluded, cannot cancel")
+            false
+        }
+    }
+
+    /**
+     * Cancel all in-flight inbound resource transfers.
+     * Matches Python `cancel_all_inbound()`. Returns how many were cancelled.
+     */
+    fun cancelAllInbound(): Int {
+        val active = inboundResources()
+        for (resource in active) resource.cancel()
+        return active.size
+    }
+
+    /**
+     * Cancel a pending outbound message by its hash/ID.
+     * Matches Python `cancel_outbound()`: cancels deferred-stamp generation,
+     * marks matching messages with [cancelState], cancels any resource-backed
+     * transfer, and re-runs outbound processing.
+     *
+     * @param messageIdHex Hex-encoded message hash
+     * @param cancelState State to assign (default CANCELLED, as in Python)
+     */
+    suspend fun cancelOutbound(
+        messageIdHex: String,
+        cancelState: MessageState = MessageState.CANCELLED,
+    ) {
+        try {
+            // Deferred-stamp queue: cancel and drop
+            if (pendingDeferredStamps.containsKey(messageIdHex)) {
+                val lxm = pendingDeferredStamps[messageIdHex]
+                if (lxm != null) {
+                    println("[LXMRouter] Cancelling deferred stamp generation for $messageIdHex")
+                    lxm.state = cancelState
+                    pendingDeferredStamps.remove(messageIdHex)
+                    lxm.failedCallback?.invoke(lxm)
+                }
+            }
+
+            var cancelledAny = false
+            pendingOutboundMutex.withLock {
+                for (message in pendingOutbound) {
+                    if (message.hash?.toHexString() == messageIdHex || messageIdHex.isEmpty()) {
+                        message.state = cancelState
+                        cancelledAny = true
+                        println("[LXMRouter] Cancelling ${message.hash?.toHexString()?.take(12)} in outbound queue")
+                    }
+                }
+                if (cancelledAny) {
+                    pendingOutbound.removeAll { it.state == cancelState }
+                }
+            }
+            if (cancelledAny) processOutbound()
+        } catch (e: Exception) {
+            println("[LXMRouter] An error occurred while cancelling $messageIdHex: ${e.message}")
+        }
+    }
+
+    /**
+     * Mark a message as failed and remove it from the outbound queue.
+     * Matches Python `fail_message()`: resets progress, sets FAILED (unless
+     * REJECTED), and fires the failed callback.
+     */
+    fun failMessage(message: LXMessage) {
+        println("[LXMRouter] ${message.hash?.toHexString()?.take(12) ?: "unpacked"} failed to send")
+        message.progress = 0.0
+        if (message.state != MessageState.REJECTED) {
+            message.state = MessageState.FAILED
+        }
+        message.failedCallback?.invoke(message)
+    }
+
+    /**
+     * Whether an active delivery link exists for the destination (direct or backchannel).
+     * Matches Python `delivery_link_available()`.
+     */
+    fun deliveryLinkAvailable(destHashHex: String): Boolean {
+        val direct = directLinks[destHashHex]
+        if (direct != null && direct.status == LinkConstants.ACTIVE) return true
+        val backchannel = backchannelLinks[destHashHex]
+        return backchannel != null && backchannel.status == LinkConstants.ACTIVE
+    }
+
+    /**
+     * Set the outbound propagation node directly from a hex hash.
+     * Matches Python `set_outbound_propagation_node()`: tears down any existing
+     * propagation link pointed at a different node. Delegates to
+     * [setActivePropagationNode], which already implements this behavior.
+     *
+     * @return True when set
+     */
+    fun setOutboundPropagationNode(destHashHex: String): Boolean = setActivePropagationNode(destHashHex)
+
+    /**
+     * Get the outbound propagation node hash.
+     * Matches Python `get_outbound_propagation_node()`.
+     */
+    fun getOutboundPropagationNode(): String? = activePropagationNodeHash
+
+    /**
+     * Not supported — matches Python 1.1.1 which raises NotImplementedError:
+     * inbound/outbound propagation node differentiation is not implemented.
+     * Kotlin has no checked exceptions; callers should treat this as terminal.
+     */
+    fun setInboundPropagationNode(destHashHex: String): Nothing =
+        throw NotImplementedError("Inbound/outbound propagation node differentiation is currently not implemented")
+
+    /**
+     * Get the inbound propagation node. Matches Python: aliases the outbound node.
+     */
+    fun getInboundPropagationNode(): String? = getOutboundPropagationNode()
+
+    /**
+     * Tear down the propagation link and reset sync state.
+     * Matches Python `cancel_propagation_node_requests()`.
+     */
+    fun cancelPropagationNodeRequests() {
+        outboundPropagationLink?.teardown()
+        outboundPropagationLink = null
+        propagationTransferState = PropagationTransferState.IDLE
+        propagationTransferProgress = 0.0
+    }
+
+    /**
+     * Msgpacked announce app-data for a registered delivery destination:
+     * [display_name, stamp_cost, supported_functionality].
+     * Matches Python `get_announce_app_data()`. Returns null for unknown destinations.
+     */
+    fun getAnnounceAppData(destHashHex: String): ByteArray? {
+        val deliveryDest = deliveryDestinations[destHashHex] ?: return null
+
+        val displayNameBytes = deliveryDest.displayName?.toByteArray(Charsets.UTF_8)
+
+        var stampCost: Int? = null
+        val cost = deliveryDest.stampCost
+        if (cost != null && cost > 0 && cost < 255) {
+            stampCost = cost
+        }
+
+        return packAnnounceAppData(displayNameBytes?.let { String(it, Charsets.UTF_8) }, stampCost ?: 0)
+    }
+
+    /**
+     * Node name metadata carried in propagation-node announces.
+     * Matches Python `get_propagation_node_announce_metadata()`. The Kotlin port
+     * does not yet support naming the router itself, so the metadata is empty.
+     */
+    fun getPropagationNodeAnnounceMetadata(): Map<Int, ByteArray> = emptyMap()
+
+    /**
+     * Msgpacked propagation-node announce payload per the Python wire format:
+     * [legacy_support=false, timebase, node_state, per_transfer_limit,
+     * per_sync_limit, [stamp_cost, flexibility, peering_cost], metadata].
+     * Matches Python `get_propagation_node_app_data()`. Returns null because the
+     * server-side propagation role (`enable_propagation`, P3) is not implemented;
+     * clients never need to emit this payload.
+     */
+    fun getPropagationNodeAppData(): ByteArray? = null
+
+    /**
+     * Router statistics snapshot. Matches Python `compile_stats()`: returns null
+     * when not running as a propagation node (client-only router).
+     */
+    fun compileStats(): Map<String, Any>? = null
+
+    /**
+     * Register JVM shutdown cleanup. Matches Python `exit_handler()`, which is
+     * wired to SIGINT/SIGTERM handlers; on the JVM the idiom is a shutdown hook.
+     * Deviation documented in port-deviations.md.
+     */
+    fun registerExitHandler() {
+        Runtime.getRuntime().addShutdownHook(
+            Thread {
+                runCatching { stop() }
+            },
+        )
+    }
 
     // ===== Cleanup Jobs (Phase 6) =====
 

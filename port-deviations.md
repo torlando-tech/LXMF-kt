@@ -1,26 +1,48 @@
-# LXMF-kt — Documented Deviations from the Python Reference
+# Port Deviations — LXMRouter client surface (feat/parity-router-client)
 
-This file is the **single source of truth** for every place where LXMF-kt's logic intentionally diverges from `markqvist/LXMF`. Any divergence not listed here is a bug, not a deviation.
+Semantic-parity deviations vs `/workspace/lxmf-ref/LXMF/LXMRouter.py` (Python LXMF 1.1.1).
+Locked decision: parity is semantic; Kotlin idioms count as satisfied.
 
-## Rule
+1. `exit_handler` → `registerExitHandler()`
+   Python wires SIGINT/SIGTERM handlers to `exit_handler()`. On the JVM the idiom is a
+   shutdown hook (`Runtime.getRuntime().addShutdownHook`). The hook calls `stop()` —
+   teardown of delivery-destination callbacks is not needed because Kotlin destinations
+   hold no global mutable callback registry to detach (callbacks live on the destination
+   object which dies with the router).
 
-> All logic in LXMF-kt MUST mirror the python reference identically. Deviations are allowed ONLY for one of two reasons, both of which MUST be documented here before the code lands.
+2. `get_outbound_lxm_propagation_stamp_cost` → derived value
+   Python reads per-message `propagation_target_cost`. Kotlin `LXMessage` does not carry
+   that field (P1 sibling scope); the method returns `getOutboundPropagationCost()` for
+   any pending message and null otherwise, which is the same effective target cost.
 
-**Allowed reason 1 — Language/runtime forced.** The python pattern cannot be expressed faithfully in kotlin or on the JVM. Examples: coroutines vs threads, `@Volatile` vs the GIL, `ReentrantLock` where python relies on GIL-implicit serialization, `kotlinx.coroutines.runBlocking` boundaries at JVM/non-coroutine seams.
+3. `set_inbound_propagation_node` → `NotImplementedError` mirrored
+   Python 1.1.1 raises NotImplementedError here; the Kotlin port throws the same
+   (`fun setInboundPropagationNode(...): Nothing`). Documented per card instruction.
 
-**Allowed reason 2 — New feature not present in python.** Kotlin-only API surface added for downstream consumers (Android lifecycle adapters, mobile-specific entry points, etc.). The kotlin-only behavior must not change semantics of any code path that *does* exist in python.
+4. `get_propagation_node_app_data` / `compile_stats` → return null
+   Both are only meaningful when the router runs as a propagation node
+   (`enable_propagation`, P3 scope). Client-only router mirrors Python's
+   `compile_stats()` early-return-null; PN app-data emission is deferred to P3.
 
-## Process
+5. `get_size` / `get_weight` / `inbound_resources`(server variants) — NOT PORTED
+   These operate on `propagation_entries` / message-store state that exists only in the
+   propagation-node role (P3). Out of scope per card boundary.
+   `get_stamp_value` likewise depends on propagation_entries — deferred to P3.
 
-1. Before changing a kotlin port file in a way that diverges from the python reference, read the corresponding python source.
-2. If the divergence is unavoidable for one of the two reasons above, add a section below using the template, then implement the change.
-3. If you're unsure whether a divergence is justified, ask the human owner before picking unilaterally. Ports drift one small "harmless" choice at a time.
-4. Reviewers should reject any PR that introduces a kotlin/python semantics divergence not represented in this file.
+6. `cancel_inbound` resource tracking via link callbacks
+   Python registers `incoming_delivery_resources` inside `delivery_link_established`.
+   Kotlin registers/unregisters from `setResourceStartedCallback` /
+   `setResourceConcludedCallback` at both link-setup sites. Same semantics; removal
+   replaces Python's status-filtering since concluded resources leave the map.
 
-## Entry template
+7. `reload_available_tickets` delegates to the boot-time loader
+   Same file format, same recreate-on-missing-section semantics as Python's inline
+   re-validation; avoids duplicating the msgpack parser.
 
-```markdown
-### <short title> — <kotlin-file-relative-path>:<line-or-symbol>
+8. `cancel_outbound` does not call `LXStamper.cancel_work(message_id)`
+   The Kotlin LXStamper has no work-registry (stamps generate in a bounded coroutine);
+   cancelling removes the message from `pendingDeferredStamps` so its stamp result is
+   discarded and delivery never proceeds.
 
 **Python reference:** `<path>:<line>` (e.g. `LXMF/LXMRouter.py:2554-2580`)
 
@@ -116,3 +138,11 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 **Description:** Python returns None because the telemetry/information store is not implemented upstream. Kotlin mirrors this exactly with a nullable `Long?` returning null, so downstream callers see identical semantics. When upstream implements it, port the real implementation rather than inventing one here.
 
 **Re-evaluation:** revisit when python LXMF lands an information store implementation.
+
+---
+
+### P2 client-surface addendum
+
+9. `update_stamp_cost` remains private with hex-string key
+   Already existed pre-P2 (semantic parity incl. async save); no public wrapper added
+   because Python callers reach it only through announce handling.
