@@ -74,3 +74,45 @@ The re-request is therefore relocated to the `closedCallback`, where kotlin actu
 This matters specifically for transport-enabled nodes: reticulum-kt's `Transport.deregisterLink` stale-path recovery (expire + re-request on pending-link timeout) is intentionally gated to non-transport nodes (Python `Transport.py:504` parity), so for transport-mode users the LXMF close-time re-request is the only mechanism that refreshes a stale path after a failed DIRECT link.
 
 **Re-evaluation:** If the kotlin `LXMRouter` ever stops eagerly removing the link in `closedCallback` and instead lets `processDirectDelivery` observe and pop CLOSED links (matching Python's `direct_links` lifecycle), move the re-request back into the CLOSED branch and delete this deviation. The per-message `pathRequestRetried` semantics would then align 1:1 with Python without the close-event approximation.
+
+### Node-side propagation packet callback receives the owning Link explicitly — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::propagationPacket`
+
+**Python reference:** `LXMF/LXMRouter.py:2664-2700` (`propagation_packet(self, data, packet)` reads `packet.link` to decide prove vs teardown).
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Tracking:** P3 parity card t_a3c5bdbc
+
+**Description:** reticulum-kt keeps `Packet.link` internal to rns-core (`getLink$rns_core()` is module-private), so a caller outside rns-core cannot read the owning link off an inbound packet as Python does. The kotlin `propagationPacket(data, packet, link)` therefore takes the link as an extra parameter supplied by `propagationLinkEstablished`'s `setPacketCallback`, and uses it for the invalid-stamp `teardown()`. Semantics are unchanged: Python's null-link early return maps to a null `link` parameter.
+
+**Re-evaluation:** if reticulum-kt ever exposes `Packet.link` publicly (or provides a safe accessor), drop the parameter and read the link off the packet again.
+
+### validate_pn_stamps_job_multip process-pool replaced by sequential validation — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXStamper.kt::validatePnStamps`
+
+**Python reference:** `LXMF/LXStamper.py:validate_pn_stamps_job_multip` (multiprocessing.Pool fan-out over `validate_pn_stamp`).
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Tracking:** P3 parity card t_a3c5bdbc
+
+**Description:** Python validates incoming propagation batches in a multiprocessing pool for CPU parallelism. On the JVM the same structured-concurrency substitution used elsewhere in this port applies: `validatePnStamps` validates sequentially on the caller's dispatcher via `mapNotNull`. Per-entry results are identical (`null` drops); only wall-clock throughput of large batch validations differs.
+
+**Re-evaluation:** if propagation-node batch throughput ever matters, swap in a coroutine `parallelMap` over Dispatchers.Default — no API change needed.
+
+### information_storage_size remains a None placeholder — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::informationStorageSize`
+
+**Python reference:** `LXMF/LXMRouter.py:information_storage_size` (returns None; unimplemented upstream placeholder).
+
+**Category:** new feature / parity with upstream placeholder
+
+**Date:** 2026-08-23
+
+**Tracking:** P3 parity card t_a3c5bdbc
+
+**Description:** Python returns None because the telemetry/information store is not implemented upstream. Kotlin mirrors this exactly with a nullable `Long?` returning null, so downstream callers see identical semantics. When upstream implements it, port the real implementation rather than inventing one here.
+
+**Re-evaluation:** revisit when python LXMF lands an information store implementation.

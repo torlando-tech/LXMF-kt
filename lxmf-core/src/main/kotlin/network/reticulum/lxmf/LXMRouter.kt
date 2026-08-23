@@ -17,6 +17,7 @@ import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
+import network.reticulum.resource.ResourceConstants
 import network.reticulum.resource.ResourceAdvertisement
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
@@ -87,6 +88,24 @@ class LXMRouter(
 
         /** LXMF propagation aspect */
         const val PROPAGATION_ASPECT = "propagation"
+
+        // Node-side constants mirrored from Python LXMRouter.py class attrs (P3).
+        const val LINK_MAX_INACTIVITY_MS = 10L * 60 * 1000
+        const val P_LINK_MAX_INACTIVITY_MS = 3L * 60 * 1000
+        const val NODE_ANNOUNCE_DELAY_MS = 20_000L
+        const val PR_PATH_TIMEOUT_SECONDS = 10
+        const val PN_STAMP_THROTTLE_SECONDS = 180L
+        const val PR_ALL_MESSAGES = 0x00
+
+        const val STATS_GET_PATH = "/pn/get/stats"
+        const val SYNC_REQUEST_PATH = "/pn/peer/sync"
+        const val UNPEER_REQUEST_PATH = "/pn/peer/unpeer"
+
+        /** Job cadences (in PROCESSING_INTERVAL ticks), mirroring Python JOB_*_INTERVAL. */
+        const val JOB_LINKS_INTERVAL_TICKS = 1L
+        const val JOB_RESOURCE_INTERVAL_TICKS = 2L
+        const val JOB_STORE_INTERVAL_TICKS = 120L
+        const val JOB_PEERSYNC_INTERVAL_TICKS = 6L
     }
 
     // ===== Message Queues =====
@@ -1849,6 +1868,8 @@ class LXMRouter(
                             cleanOutboundStampCosts()
                             cleanAvailableTickets()
                         }
+                        // Node-side job cadences (Python jobs()/jobloop() replacement).
+                        runNodeJobs()
                     } catch (e: Exception) {
                         println("Error in processing loop: ${e.message}")
                     }
@@ -3395,7 +3416,1516 @@ class LXMRouter(
             }
         }
 
-    /** Unpack a msgpack value as Long, tolerating float encoding. */
+    // ===== Node-Side Surface: Propagation Node (P3) =====
+    // Ports the NODE-SIDE surface of Python LXMRouter.py so a JVM process can
+    // act as a propagation/storage node. Peering (LXMPeer, sync_peers,
+    // rotate_peers, distribution queues) is OUT OF SCOPE here — P4 owns it;
+    // call sites that would touch peers are marked PEER-P4 below.
+    //
+    // Node-side constants live in the single class companion object above.
+
+    /** Error codes shared with LXMPeer wire protocol (Python LXMPeer.ERROR_*). */
+    object NodeErrors {
+        const val ERROR_NO_IDENTITY = LXMFConstants.ERROR_NO_IDENTITY
+        const val ERROR_NO_ACCESS = LXMFConstants.ERROR_NO_ACCESS
+        const val ERROR_INVALID_KEY = 0xf3
+        const val ERROR_INVALID_DATA = 0xf4
+        const val ERROR_INVALID_STAMP = LXMFConstants.ERROR_INVALID_STAMP
+        const val ERROR_THROTTLED = 0xf6
+        const val ERROR_NOT_FOUND = 0xfd
+        const val ERROR_TIMEOUT = 0xfe
+    }
+
+    /**
+     * One stored propagation message. Mirrors the positional Python list
+     * `propagation_entries[transient_id]`:
+     * [destination_hash, filepath, received, msg_size, handled_peers,
+     *  unhandled_peers, stamp_value]. The peer-tracking slots are P4 territory
+     * and intentionally absent here (documented deviation).
+     */
+    data class PropagationEntry(
+        val destinationHash: ByteArray,
+        val filePath: String,
+        val receivedSeconds: Long,
+        val sizeBytes: Long,
+        val stampValue: Int,
+    ) {
+        override fun equals(other: Any?): Boolean =
+            other is PropagationEntry &&
+                destinationHash.contentEquals(other.destinationHash) &&
+                filePath == other.filePath &&
+                receivedSeconds == other.receivedSeconds &&
+                sizeBytes == other.sizeBytes &&
+                stampValue == other.stampValue
+
+        override fun hashCode(): Int = filePath.hashCode()
+    }
+
+    /** Compiled node statistics (subset reachable without LXMPeer — see compileStats). */
+    data class NodeStats(
+        val identityHashHex: String?,
+        val propagationDestinationHashHex: String?,
+        val uptimeSeconds: Long,
+        val messagestoreCount: Int,
+        val messagestoreBytes: Long?,
+        val messagestoreLimitBytes: Long?,
+        val clientPropagationMessagesReceived: Long,
+        val clientPropagationMessagesServed: Long,
+        val unpeeredPropagationIncoming: Long,
+        val unpeeredPropagationRxBytes: Long,
+    )
+
+    // ----- Node state -----
+
+    /** Whether this router instance is currently acting as a propagation node. */
+    @Volatile
+    var propagationNodeEnabled: Boolean = false
+        private set
+
+    /** Directory holding the message store ({storagePath}/lxmf/messagestore). */
+    private var messageStoreDir: File? = null
+
+    /** Stored propagation messages: transient_id_hex -> entry. */
+    private val propagationEntries = ConcurrentHashMap<String, PropagationEntry>()
+
+    /** Inbound propagation destination (created by enablePropagation). */
+    var propagationDestination: Destination? = null
+        private set
+
+    /** Control destination for authenticated stats/peering requests. */
+    var controlDestination: Destination? = null
+        private set
+
+    /** Identities allowed to issue control requests (stats/peer sync). Hex strings. */
+    private val controlAllowedList = mutableListOf<String>()
+
+    /** Maximum message store size in bytes; null = unlimited. */
+    @Volatile
+    private var messageStorageLimitBytes: Long? = null
+
+    /** Maximum information (telemetry) store size in bytes; null = unlimited. */
+    @Volatile
+    private var informationStorageLimitBytes: Long? = null
+
+    /** Locally processed (seen-but-not-delivered-to-us) transient IDs: hex -> seconds. */
+    private val locallyProcessedTransientIds = ConcurrentHashMap<String, Long>()
+
+    /** Node uptime anchor. */
+    @Volatile
+    private var propagationNodeStartTimeSeconds: Long = 0
+
+    // ----- Node configuration (Python __init__ defaults) -----
+
+    @Volatile var propagationStampCost: Int = LXMFConstants.PROPAGATION_COST
+    @Volatile var propagationStampCostFlexibility: Int = LXMFConstants.PROPAGATION_COST_FLEX
+    @Volatile var peeringCost: Int = LXMFConstants.PEERING_COST
+    @Volatile var maxPeeringCost: Int = LXMFConstants.MAX_PEERING_COST
+    @Volatile var fromStaticOnly: Boolean = false
+    @Volatile var propagationSequentialValidation: Boolean = true
+    @Volatile var propagationMaxInboundSyncs: Int = 2
+    @Volatile var enforceRatchetsFlag: Boolean = false
+    @Volatile var retainSyncedOnNode: Boolean = false
+    @Volatile var autopeerMaxDepth: Int = 1
+    @Volatile var nodeName: String? = null
+    @Volatile var deliveryPerTransferLimitKb: Int = LXMFConstants.DELIVERY_LIMIT_KB
+    @Volatile var propagationPerTransferLimitKb: Int = LXMFConstants.PROPAGATION_LIMIT_KB
+    @Volatile var propagationPerSyncLimitKb: Int = LXMFConstants.SYNC_LIMIT_KB
+
+    // ----- Node runtime tracking -----
+
+    /** Links carrying inbound propagation sync transfers. */
+    private val activePropagationLinks = mutableListOf<Link>()
+
+    /** link_id_hex -> OFFER_* state for accepted inbound sync offers. */
+    private val acceptedOfferLinks = ConcurrentHashMap<String, Int>()
+
+    /** link_id_hex -> true once an offer presented a valid peering key. */
+    private val validatedPeerLinks = ConcurrentHashMap<String, Boolean>()
+
+    /** remote_hash_hex -> throttle-until epoch seconds (invalid-stamp offenders). */
+    private val throttledPeers = ConcurrentHashMap<String, Long>()
+
+    /** remote_hash_hex -> validation-started epoch seconds (sequential validation gate). */
+    private val validatingPnStampsFrom = ConcurrentHashMap<String, Long>()
+
+    private val acceptedOfferLinksMutex = Mutex()
+
+    // Offer accounting states (Python LXMRouter.OFFER_*).
+    private val OFFER_ACCEPTED = 0x01
+    private val OFFER_VALIDATING = 0x02
+    private val OFFER_TRANSFERRING = 0x03
+
+    // Client-facing node counters (persisted via save_node_stats in Python).
+    @Volatile var clientPropagationMessagesReceived: Long = 0
+        private set
+    @Volatile var clientPropagationMessagesServed: Long = 0
+        private set
+    @Volatile var unpeeredPropagationIncoming: Long = 0
+        private set
+    @Volatile var unpeeredPropagationRxBytes: Long = 0
+        private set
+
+    /** Path-request download bookkeeping (Python wants_download_on_path_available_*). */
+    @Volatile private var wantsDownloadOnPathAvailableFrom: ByteArray? = null
+    @Volatile private var wantsDownloadOnPathAvailableTo: Any? = null
+    @Volatile private var wantsDownloadOnPathAvailableTimeoutSeconds: Long = 0
+    private var requestMessagesPathJob: Job? = null
+
+    // ==================== Lifecycle: enable/disable propagation ====================
+
+    /**
+     * Turn this router into a propagation/storage node.
+     *
+     * Mirrors Python LXMRouter.enable_propagation():
+     * 1. Create the message store directory and index existing messages.
+     * 2. Reload persisted node statistics.
+     * 3. Wire packet/link callbacks and request handlers onto the
+     *    lxmf.propagation destination and the authenticated control
+     *    destination.
+     * 4. Announce the node (after NODE_ANNOUNCE_DELAY_MS).
+     *
+     * Deviation: peer synchronisation state rebuild (Python rebuilds LXMPeer
+     * instances from the peers store) is deferred to P4 — no peering here.
+     */
+    fun enablePropagation() {
+        val routerIdentity =
+            identity ?: throw IllegalStateException(
+                "enablePropagation requires a router identity (LXMRouter(identity=...))",
+            )
+        val storage = storagePath ?: throw IllegalStateException("enablePropagation requires a storagePath")
+
+        try {
+            val baseDir = File(storage, "lxmf")
+            if (!baseDir.exists()) baseDir.mkdirs()
+            val msgDir = File(baseDir, "messagestore")
+            if (!msgDir.exists()) msgDir.mkdirs()
+            messageStoreDir = msgDir
+
+            propagationEntries.clear()
+
+            // Index message store. Filename convention (matches Python):
+            //   <transient_id_hex>_<received_seconds[_<stamp_value>]>
+            val startedAt = System.currentTimeMillis()
+            for (file in msgDir.listFiles() ?: emptyArray()) {
+                val components = file.name.split("_")
+                if (components.size >= 3 && components[0].length == RnsConstants.TRUNCATED_HASH_BYTES * 2) {
+                    try {
+                        val received = components[1].toDouble().toLong()
+                        val stampValue = components[2].toIntOrNull() ?: continue
+                        if (received <= 0) continue
+                        val data = file.readBytes()
+                        if (data.size < LXMFConstants.DESTINATION_LENGTH) continue
+                        propagationEntries[components[0]] =
+                            PropagationEntry(
+                                destinationHash = data.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH),
+                                filePath = file.absolutePath,
+                                receivedSeconds = received,
+                                sizeBytes = data.size.toLong(),
+                                stampValue = stampValue,
+                            )
+                    } catch (e: Exception) {
+                        println("[LXMRouter] Could not read LXM from message store (${file.name}): ${e.message}")
+                    }
+                }
+            }
+            println("[LXMRouter] Indexed ${propagationEntries.size} messages in ${System.currentTimeMillis() - startedAt}ms")
+
+            // Restore node stats.
+            loadNodeStats()
+
+            // Propagation destination.
+            val propDest =
+                Destination.create(
+                    identity = routerIdentity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = APP_NAME,
+                    PROPAGATION_ASPECT,
+                )
+            propDest.setLinkEstablishedCallback { link -> propagationLinkEstablished(link as Link) }
+            propDest.packetCallback = { data, packet -> propagationPacket(data, packet as? Packet) }
+            Transport.registerDestination(propDest)
+
+            propDest.registerRequestHandler(
+                path = LXMFConstants.OFFER_REQUEST_PATH,
+                responseGenerator = { path, data, _, linkId, remoteIdentity, _ ->
+                    encodeMsgpackValue(offerRequest(path, data ?: ByteArray(0), linkId, remoteIdentity))
+                },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_ALL,
+            )
+            propDest.registerRequestHandler(
+                path = LXMFConstants.MESSAGE_GET_PATH,
+                responseGenerator = { path, data, _, _, remoteIdentity, _ ->
+                    encodeMsgpackValue(messageGetRequest(path, data ?: ByteArray(0), remoteIdentity))
+                },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_ALL,
+            )
+            propagationDestination = propDest
+
+            // Control destination (self first in the allowed list).
+            controlAllowedList.clear()
+            controlAllowedList.add(routerIdentity.hexHash)
+            val ctrlDest =
+                Destination.create(
+                    identity = routerIdentity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = APP_NAME,
+                    PROPAGATION_ASPECT,
+                    "control",
+                )
+            ctrlDest.registerRequestHandler(
+                path = STATS_GET_PATH,
+                responseGenerator = { path, _, _, _, remoteIdentity, _ ->
+                    encodeMsgpackValue(statsGetRequest(path, remoteIdentity))
+                },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
+                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+            )
+            // Peer sync/unpeer control requests authenticate identically, but the
+            // peering table itself arrives with P4 (PEER-P4); until then any
+            // authenticated request resolves to ERROR_NOT_FOUND, matching the
+            // observable behaviour of an empty Python peers dict.
+            ctrlDest.registerRequestHandler(
+                path = SYNC_REQUEST_PATH,
+                responseGenerator = { _, data, _, _, remoteIdentity, _ ->
+                    encodeMsgpackValue(peerSyncRequest(data, remoteIdentity))
+                },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
+                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+            )
+            ctrlDest.registerRequestHandler(
+                path = UNPEER_REQUEST_PATH,
+                responseGenerator = { _, data, _, _, remoteIdentity, _ ->
+                    encodeMsgpackValue(peerUnpeerRequest(data, remoteIdentity))
+                },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST,
+                allowedList = controlAllowedList.mapNotNull { hexToBytesOrNull(it) },
+            )
+            Transport.registerDestination(ctrlDest)
+            controlDestination = ctrlDest
+
+            propagationNodeEnabled = true
+            propagationNodeStartTimeSeconds = System.currentTimeMillis() / 1000
+
+            println("[LXMRouter] Propagation node message store size is ${messageStorageSize()} bytes")
+
+            announcePropagationNode()
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not enable propagation node: ${e.message}")
+            throw e
+        }
+    }
+
+    /**
+     * Stop acting as a propagation node and re-announce the disabled state.
+     * Mirrors Python LXMRouter.disable_propagation().
+     */
+    fun disablePropagation() {
+        propagationNodeEnabled = false
+        announcePropagationNode()
+    }
+
+    /**
+     * Announce the propagation node after NODE_ANNOUNCE_DELAY_MS.
+     *
+     * Deviation: Python spawns a daemon thread that sleeps then announces;
+     * here a coroutine on the router's process-lifetime scope does the same.
+     */
+    fun announcePropagationNode(delayMillis: Long = NODE_ANNOUNCE_DELAY_MS) {
+        processingScope.launch {
+            delay(delayMillis)
+            try {
+                val dest = propagationDestination ?: return@launch
+                dest.announce(getPropagationNodeAppData())
+                if (controlAllowedList.size > 1) {
+                    controlDestination?.announce(null)
+                }
+            } catch (e: Exception) {
+                println("[LXMRouter] Delayed propagation node announce failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Build the lxmf.propagation announce app data payload.
+     *
+     * Mirrors Python get_propagation_node_app_data()'s 7-element structure:
+     * [legacy_support=false, timebase, node_state, per_transfer_limit_kb,
+     *  per_sync_limit_kb, [stamp_cost, flexibility, peering_cost], metadata].
+     */
+    fun getPropagationNodeAppData(): ByteArray {
+        val buffer = ByteArrayOutputStream()
+        val packer = MessagePack.newDefaultPacker(buffer)
+        packer.packArrayHeader(7)
+        packer.packBoolean(false) // legacy PN support flag
+        packer.packLong(System.currentTimeMillis() / 1000)
+        packer.packBoolean(propagationNodeEnabled && !fromStaticOnly)
+        packer.packInt(propagationPerTransferLimitKb)
+        packer.packInt(propagationPerSyncLimitKb)
+        packer.packArrayHeader(3)
+        packer.packInt(propagationStampCost)
+        packer.packInt(propagationStampCostFlexibility)
+        packer.packInt(peeringCost)
+        // Metadata map: name entry when configured (Python get_propagation_node_announce_metadata).
+        if (nodeName != null) {
+            packer.packMapHeader(1)
+            packer.packInt(LXMFConstants.PN_META_NAME)
+            packer.packString(nodeName!!)
+        } else {
+            packer.packMapHeader(0)
+        }
+        packer.close()
+        return buffer.toByteArray()
+    }
+
+    // ==================== Storage limits ====================
+
+    /**
+     * Set the maximum propagation message store size.
+     * Mirrors Python set_message_storage_limit(kilobytes, megabytes, gigabytes);
+     * all-zero arguments clear the limit. Throws on non-positive totals.
+     */
+    fun setMessageStorageLimit(
+        kilobytes: Long? = null,
+        megabytes: Long? = null,
+        gigabytes: Long? = null,
+    ) {
+        var limitBytes = 0L
+        kilobytes?.let { limitBytes += it * 1000 }
+        megabytes?.let { limitBytes += it * 1000 * 1000 }
+        gigabytes?.let { limitBytes += it * 1000 * 1000 * 1000 }
+        if (limitBytes == 0L) {
+            messageStorageLimitBytes = null
+            return
+        }
+        require(limitBytes > 0) { "Cannot set LXMF message storage limit to $limitBytes" }
+        messageStorageLimitBytes = limitBytes
+    }
+
+    fun messageStorageLimitBytes(): Long? = messageStorageLimitBytes
+
+    /**
+     * Current message store size in bytes, or null when not running as a
+     * propagation node. Mirrors Python message_storage_size().
+     */
+    fun messageStorageSize(): Long? {
+        if (!propagationNodeEnabled) return null
+        return propagationEntries.values.sumOf { it.sizeBytes }
+    }
+
+    /** Set information (telemetry) store limit. Same units contract as [setMessageStorageLimit]. */
+    fun setInformationStorageLimit(
+        kilobytes: Long? = null,
+        megabytes: Long? = null,
+        gigabytes: Long? = null,
+    ) {
+        var limitBytes = 0L
+        kilobytes?.let { limitBytes += it * 1000 }
+        megabytes?.let { limitBytes += it * 1000 * 1000 }
+        gigabytes?.let { limitBytes += it * 1000 * 1000 * 1000 }
+        if (limitBytes == 0L) {
+            informationStorageLimitBytes = null
+            return
+        }
+        require(limitBytes > 0) { "Cannot set LXMF information storage limit to $limitBytes" }
+        informationStorageLimitBytes = limitBytes
+    }
+
+    fun informationStorageLimitBytes(): Long? = informationStorageLimitBytes
+
+    /**
+     * Information storage size. Python returns None (unimplemented placeholder);
+     * Kotlin mirrors with null. Documented in port-deviations.md.
+     */
+    fun informationStorageSize(): Long? = null
+
+    // ==================== Message store operations ====================
+
+    /** Whether a message with this transient id has been delivered locally. */
+    fun hasMessage(transientId: ByteArray): Boolean =
+        locallyDeliveredTransientIds.containsKey(transientId.toHexString())
+
+    /**
+     * Eviction weight for culling (Python get_weight): size scaled by age and
+     * priority. Higher weight = evicted sooner.
+     */
+    internal fun getWeight(entry: PropagationEntry): Double {
+        val now = System.currentTimeMillis() / 1000
+        val ageWeight = maxOf(1.0, (now - entry.receivedSeconds) / 60.0 / 60.0 / 24.0 / 4.0)
+        val priorityWeight =
+            if (prioritisedList.any { it.contentEquals(entry.destinationHash) }) 0.1 else 1.0
+        return priorityWeight * ageWeight * entry.sizeBytes
+    }
+
+    /**
+     * Expire old messages and enforce the storage limit.
+     * Mirrors Python clean_message_store().
+     */
+    fun cleanMessageStore() {
+        if (!propagationNodeEnabled) return
+        println("[LXMRouter] Cleaning message store")
+        val dir = messageStoreDir
+        val now = System.currentTimeMillis() / 1000
+        val removed = mutableListOf<Pair<String, String>>() // transientIdHex to filepath
+
+        for ((transientIdHex, entry) in propagationEntries) {
+            val name = File(entry.filePath).name
+            val components = name.split("_")
+            val validShape =
+                components.size == 3 &&
+                    (components[1].toDoubleOrNull()?.let { it > 0 } == true) &&
+                    components[0].length == RnsConstants.TRUNCATED_HASH_BYTES * 2 &&
+                    components[2].toIntOrNull() == entry.stampValue
+            if (validShape) {
+                if (now > entry.receivedSeconds + LXMFConstants.MESSAGE_EXPIRY) {
+                    removed.add(Pair(transientIdHex, entry.filePath))
+                }
+            } else {
+                println("[LXMRouter] Purging message ${entry.filePath.takeLast(24)} due to invalid file path")
+                removed.add(Pair(transientIdHex, entry.filePath))
+            }
+        }
+
+        for ((transientIdHex, filePath) in removed) {
+            propagationEntries.remove(transientIdHex)
+            try {
+                File(filePath).delete()
+            } catch (e: Exception) {
+                println("[LXMRouter] Could not remove $transientIdHex from message store: ${e.message}")
+            }
+        }
+        if (removed.isNotEmpty()) {
+            println("[LXMRouter] Cleaned ${removed.size} entries from the message store")
+        }
+
+        // Cull by weight when over limit.
+        val size = messageStorageSize() ?: return
+        val limit = messageStorageLimitBytes ?: return
+        if (size <= limit) return
+        var bytesNeeded = size - limit
+        var bytesCleaned = 0L
+
+        val weighted =
+            propagationEntries.entries
+                .map { Triple(it.value, getWeight(it.value), it.key) }
+                .sortedByDescending { it.second }
+
+        for ((entry, weight, transientIdHex) in weighted) {
+            if (bytesCleaned >= bytesNeeded) break
+            try {
+                File(entry.filePath).delete()
+                propagationEntries.remove(transientIdHex)
+                bytesCleaned += entry.sizeBytes
+                println("[LXMRouter] Removed $transientIdHex with weight $weight to clear up ${entry.sizeBytes} bytes")
+            } catch (e: Exception) {
+                println("[LXMRouter] Error while cleaning LXMF message from store: ${e.message}")
+            }
+        }
+        bytesNeeded = 0 // silence unused warnings in odd compilers
+        println("[LXMRouter] Message store size is now ${messageStorageSize()} for ${propagationEntries.size} items")
+    }
+
+    // ==================== Remote access: message_get_request ====================
+
+    /**
+     * Serve an inbound MESSAGE_GET_PATH ("/get") request.
+     *
+     * Mirrors Python message_get_request(). Request data layout:
+     *   [wants(list|nil), haves(list|nil), optional_transfer_limit_kb]
+     * Response values (msgpack-encoded by the registered wrapper):
+     *  - error int (NO_IDENTITY / NO_ACCESS),
+     *  - list of available transient_ids sorted ascending by size (both nil),
+     *  - list of raw lxmf_data blobs (stamp stripped) honouring the limit.
+     */
+    fun messageGetRequest(
+        path: String,
+        data: ByteArray,
+        remoteIdentity: Identity?,
+    ): Any? {
+        if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
+        if (!identityAllowed(remoteIdentity)) return NodeErrors.ERROR_NO_ACCESS
+
+        return try {
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            unpacker.unpackArrayHeader()
+            val wants = unpackMsgpackIdListOrNul(unpacker)
+            val haves = unpackMsgpackIdListOrNul(unpacker)
+            var transferLimitKb: Float? = null
+            if (unpacker.hasNext() && unpacker.nextFormat.valueType != org.msgpack.value.ValueType.NIL) {
+                transferLimitKb = unpackAsLong(unpacker).toFloat()
+            }
+            unpacker.close()
+
+            val remoteDestinationHashHex =
+                Destination.hashFromNameAndIdentity("$APP_NAME.$DELIVERY_ASPECT", remoteIdentity.hash).toHexString()
+
+            if (wants == null && haves == null) {
+                // Listing mode: sizes ascending.
+                val available =
+                    propagationEntries.entries
+                        .filter { it.value.destinationHash.toHexString() == remoteDestinationHashHex }
+                        .map { Pair(it.key, it.value.sizeBytes) }
+                        .sortedBy { it.second }
+                        .map { it.first }
+                return available.map { hexToBytes(it)!! }
+            }
+
+            // Purge messages the client reports having.
+            haves?.forEach { transientId ->
+                val hex = transientId.toHexString()
+                val entry = propagationEntries[hex]
+                if (entry != null && entry.destinationHash.toHexString() == remoteDestinationHashHex) {
+                    try {
+                        propagationEntries.remove(hex)
+                        File(entry.filePath).delete()
+                    } catch (e: Exception) {
+                        println("[LXMRouter] Error purging message $hex: ${e.message}")
+                    }
+                }
+            }
+
+            // Serve wanted messages within the cumulative transfer budget.
+            val response = mutableListOf<ByteArray>()
+            if (wants != null && wants.isNotEmpty()) {
+                val clientTransferLimitBytes = transferLimitKb?.times(1000f)
+                var cumulativeSize = 24
+                val perMessageOverhead = 16
+                for (transientId in wants) {
+                    val hex = transientId.toHexString()
+                    val entry = propagationEntries[hex] ?: continue
+                    if (entry.destinationHash.toHexString() != remoteDestinationHashHex) continue
+                    try {
+                        val stamped = File(entry.filePath).readBytes()
+                        val lxmSize = stamped.size
+                        val nextSize = cumulativeSize + lxmSize + perMessageOverhead
+                        if (clientTransferLimitBytes != null && nextSize > clientTransferLimitBytes) continue
+                        // Strip the appended PN stamp before sending (Python slices
+                        // lxmf_data[:-STAMP_SIZE]).
+                        val stripped =
+                            if (stamped.size >= LXStamper.STAMP_SIZE) {
+                                stamped.copyOfRange(0, stamped.size - LXStamper.STAMP_SIZE)
+                            } else {
+                                stamped
+                            }
+                        response.add(stripped)
+                        cumulativeSize += lxmSize + perMessageOverhead
+                    } catch (e: Exception) {
+                        println("[LXMRouter] Error serving message $hex: ${e.message}")
+                    }
+                }
+            }
+            clientPropagationMessagesServed += response.size
+            response
+        } catch (e: Exception) {
+            println("[LXMRouter] Error generating message_get response: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Serve an inbound OFFER_REQUEST_PATH ("/offer") request during inbound
+     * sync. Mirrors Python offer_request(): validates identity, sequential
+     * validation pressure, inbound-sync concurrency, throttling, static-only
+     * policy and the peering key proof-of-work, then returns which offered
+     * messages this node wants.
+     *
+     * Request data: [peering_key(bytes), transient_ids(list)].
+     * Response: error int | true(all wanted) | false(nothing wanted) |
+     *           wanted id list.
+     */
+    fun offerRequest(
+        path: String,
+        data: ByteArray,
+        linkId: ByteArray,
+        remoteIdentity: Identity?,
+    ): Any? {
+        if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
+
+        val remoteHashHex =
+            Destination.hashFromNameAndIdentity("$APP_NAME.$PROPAGATION_ASPECT", remoteIdentity.hash).toHexString()
+
+        // Sequential-validation gate (PEER-P4 note: static-peer bypass is
+        // unreachable while peering is out of scope).
+        if (propagationSequentialValidation && validatingPnStampsFrom.isNotEmpty()) {
+            println("[LXMRouter] Propagation offer postponed, already validating ${validatingPnStampsFrom.size} PN stamp batches")
+            return NodeErrors.ERROR_THROTTLED
+        }
+
+        if (propagationMaxInboundSyncs > 0 && propagationResourcesTransferring() >= propagationMaxInboundSyncs) {
+            println("[LXMRouter] Propagation offer postponed, already receiving ${propagationResourcesTransferring()} sync resources")
+            return NodeErrors.ERROR_THROTTLED
+        }
+
+        throttledPeers[remoteHashHex]?.let { throttleUntil ->
+            val remaining = throttleUntil - System.currentTimeMillis() / 1000
+            if (remaining > 0) {
+                println("[LXMRouter] Propagation offer rejected, throttled for $remaining more seconds")
+                return NodeErrors.ERROR_THROTTLED
+            }
+            throttledPeers.remove(remoteHashHex)
+        }
+
+        if (fromStaticOnly) {
+            println("[LXMRouter] Rejecting propagation request: static-peers-only mode (peering is P4)")
+            return NodeErrors.ERROR_NO_ACCESS
+        }
+
+        try {
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            if (unpacker.nextFormat.valueType != org.msgpack.value.ValueType.ARRAY) {
+                unpacker.close()
+                return NodeErrors.ERROR_INVALID_DATA
+            }
+            val header = unpacker.unpackArrayHeader()
+            if (header < 2) {
+                unpacker.close()
+                return NodeErrors.ERROR_INVALID_DATA
+            }
+            val keyLen = unpacker.unpackBinaryHeader()
+            val peeringKey = ByteArray(keyLen).also { unpacker.readPayload(it) }
+            val idsLen = unpacker.unpackArrayHeader()
+            val transientIds = mutableListOf<ByteArray>()
+            for (i in 0 until idsLen) {
+                val len = unpacker.unpackBinaryHeader()
+                transientIds.add(ByteArray(len).also { unpacker.readPayload(it) })
+            }
+            unpacker.close()
+
+            // Peering key: PoW over node_identity_hash + peer_identity_hash.
+            val peeringId = (identity!!.hash + remoteIdentity.hash)
+            val peeringKeyValid =
+                LXStamper.validatePeeringKey(peeringId, peeringKey, peeringCost)
+            if (!peeringKeyValid) {
+                println("[LXMRouter] Invalid peering key for incoming sync offer")
+                return NodeErrors.ERROR_INVALID_KEY
+            }
+            validatedPeerLinks[linkId.toHexString()] = true
+
+            val wanted = mutableListOf<ByteArray>()
+            for (transientId in transientIds) {
+                if (!propagationEntries.containsKey(transientId.toHexString())) wanted.add(transientId)
+            }
+
+            return when {
+                wanted.isEmpty() -> false
+                wanted.size == transientIds.size -> true
+                else -> {
+                    acceptedOfferLinks[linkId.toHexString()] = OFFER_ACCEPTED
+                    wanted
+                }
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Error generating response for sync request: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Authenticated stats request handler. Mirrors Python stats_get_request();
+     * returns compiled stats or an error int.
+     */
+    fun statsGetRequest(
+        path: String,
+        remoteIdentity: Identity?,
+    ): Any? {
+        if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
+        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        return compileStatsMap()
+    }
+
+    /**
+     * Compile node statistics. Peer detail (Python peer_stats sub-dict) is
+     * omitted until P4 lands peering — documented deviation.
+     */
+    fun compileStats(): NodeStats? {
+        if (!propagationNodeEnabled) return null
+        val map = compileStatsMap() as? Map<*, *> ?: return null
+        val store = map["messagestore"] as? Map<*, *>
+        return NodeStats(
+            identityHashHex = identity?.hash?.toHexString(),
+            propagationDestinationHashHex = propagationDestination?.hexHash,
+            uptimeSeconds = (map["uptime"] as? Long) ?: 0,
+            messagestoreCount = (store?.get("count") as? Int) ?: 0,
+            messagestoreBytes = store?.get("bytes") as? Long?,
+            messagestoreLimitBytes = store?.get("limit") as? Long?,
+            clientPropagationMessagesReceived = (map["clients"] as? Map<*, *>)?.get("received") as? Long ?: clientPropagationMessagesReceived,
+            clientPropagationMessagesServed = clientPropagationMessagesServed,
+            unpeeredPropagationIncoming = unpeeredPropagationIncoming,
+            unpeeredPropagationRxBytes = unpeeredPropagationRxBytes,
+        )
+    }
+
+    /** Msgpack-shaped stats matching the Python wire structure (minus peers). */
+    private fun compileStatsMap(): Map<String, Any?>? {
+        if (!propagationNodeEnabled) return null
+        return mapOf(
+            "identity_hash" to (identity?.hash?.toHexString()),
+            "destination_hash" to (propagationDestination?.hexHash),
+            "uptime" to (System.currentTimeMillis() / 1000 - propagationNodeStartTimeSeconds),
+            "delivery_limit" to deliveryPerTransferLimitKb,
+            "propagation_limit" to propagationPerTransferLimitKb,
+            "sync_limit" to propagationPerSyncLimitKb,
+            "target_stamp_cost" to propagationStampCost,
+            "stamp_cost_flexibility" to propagationStampCostFlexibility,
+            "peering_cost" to peeringCost,
+            "max_peering_cost" to maxPeeringCost,
+            "from_static_only" to fromStaticOnly,
+            "messagestore" to
+                mapOf(
+                    "count" to propagationEntries.size,
+                    "bytes" to messageStorageSize(),
+                    "limit" to messageStorageLimitBytes,
+                ),
+            "clients" to
+                mapOf(
+                    "client_propagation_messages_received" to clientPropagationMessagesReceived,
+                    "client_propagation_messages_served" to clientPropagationMessagesServed,
+                ),
+            "unpeered_propagation_incoming" to unpeeredPropagationIncoming,
+            "unpeered_propagation_rx_bytes" to unpeeredPropagationRxBytes,
+            "static_peers" to 0, // PEER-P4
+            "discovered_peers" to 0, // PEER-P4
+            "total_peers" to 0, // PEER-P4
+            "peers" to emptyMap<String, Any>(), // PEER-P4
+        )
+    }
+
+    /** Peer sync control request (authenticated). Peering table is P4; mirrors the empty-peers behaviour. */
+    fun peerSyncRequest(
+        data: ByteArray?,
+        remoteIdentity: Identity?,
+    ): Any? {
+        if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
+        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        if (data == null || data.size != RnsConstants.TRUNCATED_HASH_BYTES) return NodeErrors.ERROR_INVALID_DATA
+        return NodeErrors.ERROR_NOT_FOUND // PEER-P4: no peers exist yet
+    }
+
+    /** Peer unpeer control request (authenticated). Peering table is P4; mirrors the empty-peers behaviour. */
+    fun peerUnpeerRequest(
+        data: ByteArray?,
+        remoteIdentity: Identity?,
+    ): Any? {
+        if (remoteIdentity == null) return NodeErrors.ERROR_NO_IDENTITY
+        if (!controlAllowedList.contains(remoteIdentity.hexHash)) return NodeErrors.ERROR_NO_ACCESS
+        if (data == null || data.size != RnsConstants.TRUNCATED_HASH_BYTES) return NodeErrors.ERROR_INVALID_DATA
+        return NodeErrors.ERROR_NOT_FOUND // PEER-P4: no peers exist yet
+    }
+
+    // ==================== Inbound propagation transfer paths ====================
+
+    /**
+     * Wire up a freshly established inbound propagation sync link.
+     * Mirrors Python propagation_link_established().
+     */
+    fun propagationLinkEstablished(link: Link) {
+        link.setPacketCallback { data, packet -> propagationPacket(data, packet, link) }
+        link.setResourceStrategy(network.reticulum.link.Link.ACCEPT_APP)
+        link.setResourceCallback { _ -> true /* acceptance decided in advertised hook below */ }
+        link.setResourceConcludedCallback { resource -> propagationResourceConcluded(resource) }
+        synchronized(activePropagationLinks) { activePropagationLinks.add(link) }
+    }
+
+    /**
+     * Number of inbound sync transfers currently past the accepted-offer stage.
+     * Mirrors the Python propagation_resources_transferring property.
+     */
+    fun propagationResourcesTransferring(): Int =
+        acceptedOfferLinks.values.count { it > OFFER_ACCEPTED }
+
+    /**
+     * Handle a raw propagation packet on a sync link.
+     *
+     * Mirrors Python propagation_packet(): payload is msgpack
+     * [remote_timebase, [[lxmf_data+stamp], ...]]; every blob must carry a PN
+     * stamp meeting (cost - flexibility). All-valid batches are proven;
+     * invalid batches trigger a rejection packet and link teardown.
+     */
+    fun propagationPacket(
+        data: ByteArray,
+        packet: Packet?,
+        link: Link? = null,
+    ) {
+        try {
+            // NOTE deviation (language/runtime forced): reticulum-kt keeps
+            // Packet.link internal to rns-core, so the owning Link is passed
+            // explicitly by the link-established callback instead of read off
+            // the packet as Python does.
+            if (link == null) return
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            unpacker.unpackArrayHeader()
+            unpacker.skipValue() // remote_timebase
+            val count = unpacker.unpackArrayHeader()
+            val messages = mutableListOf<ByteArray>()
+            for (i in 0 until count) {
+                val len = unpacker.unpackBinaryHeader()
+                messages.add(ByteArray(len).also { unpacker.readPayload(it) })
+            }
+            unpacker.close()
+
+            val minAcceptedCost = maxOf(0, propagationStampCost - propagationStampCostFlexibility)
+            val validated = LXStamper.validatePnStamps(messages, minAcceptedCost)
+
+            for (entry in validated) {
+                lxmfPropagation(entry.lxmfData, stampValue = entry.value, stampData = entry.stampData)
+                clientPropagationMessagesReceived++
+            }
+
+            if (validated.size == messages.size) {
+                println("[LXMRouter] Received ${messages.size} propagation message(s) with valid stamps")
+                packet?.prove()
+            } else {
+                println("[LXMRouter] Propagation transfer contained invalid stamps")
+                link?.teardown()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Exception occurred while parsing incoming LXMF propagation data: ${e.message}")
+        }
+    }
+
+    /**
+     * Resource-size gate for inbound propagation sync resources.
+     * Mirrors Python propagation_resource_advertised() (static-peer identity
+     * checks reduced to a hard reject while peering is P4).
+     */
+    fun propagationResourceAdvertised(advertisement: network.reticulum.resource.ResourceAdvertisement): Boolean {
+        if (fromStaticOnly) {
+            println("[LXMRouter] Rejecting propagation resource: static-peers-only mode (peering is P4)")
+            return false
+        }
+        val limitBytes = propagationPerSyncLimitKb * 1000
+        if (advertisement.dataSize > limitBytes) {
+            println("[LXMRouter] Rejecting ${advertisement.dataSize} byte propagation resource, exceeds ${limitBytes} byte limit")
+            return false
+        }
+        return true
+    }
+
+    /** Track a began inbound propagation resource (logging parity with Python). */
+    fun propagationResourceTransferBegan(resource: Any) {
+        println("[LXMRouter] Began transfer for LXMF propagation resource")
+    }
+
+    /**
+     * Consume a completed inbound propagation resource: unpack
+     * [remote_timebase, messages], validate PN stamps, ingest valid messages
+     * and throttle senders on invalid batches.
+     * Mirrors Python propagation_resource_concluded() minus peer accounting
+     * (PEER-P4) and autopeering (PEER-P4).
+     */
+    fun propagationResourceConcluded(resource: Any) {
+        val res = resource as? Resource
+        if (res == null) {
+            println("[LXMRouter] Ignoring unknown resource type in propagation conclusion")
+            return
+        }
+        try {
+            if (res.status == ResourceConstants.COMPLETE) {
+                val payload = res.data
+                if (payload == null) {
+                    println("[LXMRouter] Completed propagation resource carried no data")
+                } else {
+                    try {
+                        val unpacker = MessagePack.newDefaultUnpacker(payload)
+                        var structured = false
+                        if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.ARRAY) {
+                            val header = unpacker.unpackArrayHeader()
+                            if (header == 2 && unpacker.nextFormat.valueType == org.msgpack.value.ValueType.ARRAY) {
+                                structured = true
+                                unpacker.skipValue() // remote_timebase
+                                val count = unpacker.unpackArrayHeader()
+                                val messages = mutableListOf<ByteArray>()
+                                for (i in 0 until count) {
+                                    val len = unpacker.unpackBinaryHeader()
+                                    messages.add(ByteArray(len).also { unpacker.readPayload(it) })
+                                }
+                                unpacker.close()
+
+                                val remoteHashHex =
+                                    res.link.getRemoteIdentity()?.let { remoteIdentity ->
+                                        Destination.hashFromNameAndIdentity(
+                                            "$APP_NAME.$PROPAGATION_ASPECT",
+                                            remoteIdentity.hash,
+                                        ).toHexString()
+                                    }
+
+                                val peeringKeyValid =
+                                    res.link.linkId.let { validatedPeerLinks[it.toHexString()] == true }
+                                if (!peeringKeyValid && messages.size > 1) {
+                                    println("[LXMRouter] Multiple propagation messages without valid peering key presentation; ignoring")
+                                    res.link.teardown()
+                                } else {
+                                    val minAcceptedCost = maxOf(0, propagationStampCost - propagationStampCostFlexibility)
+                                    val validated = LXStamper.validatePnStamps(messages, minAcceptedCost)
+                                    val invalidCount = messages.size - validated.size
+
+                                    for (entry in validated) {
+                                        if (remoteHashHex == null) {
+                                            clientPropagationMessagesReceived++
+                                        } else {
+                                            unpeeredPropagationIncoming++
+                                            unpeeredPropagationRxBytes += entry.lxmfData.size
+                                        }
+                                        lxmfPropagation(entry.lxmfData, stampValue = entry.value, stampData = entry.stampData)
+                                    }
+
+                                    if (invalidCount > 0) {
+                                        res.link.teardown()
+                                        if (remoteHashHex != null) {
+                                            throttledPeers[remoteHashHex] =
+                                                System.currentTimeMillis() / 1000 + PN_STAMP_THROTTLE_SECONDS
+                                        }
+                                        println("[LXMRouter] Propagation transfer contained $invalidCount invalid stamp(s); sender throttled")
+                                    }
+                                }
+                            }
+                        }
+                        if (!structured) {
+                            println("[LXMRouter] Invalid data structure received at propagation destination, ignoring")
+                        }
+                    } catch (e: Exception) {
+                        println("[LXMRouter] Error while unpacking received propagation resource: ${e.message}")
+                    }
+                }
+            }
+
+            // Clear accepted-offer accounting for this link either way.
+            acceptedOfferLinks.remove(res.link.linkId.toHexString())
+        } catch (e: Exception) {
+            println("[LXMRouter] Error concluding propagation resource: ${e.message}")
+        }
+    }
+
+    /**
+     * Handle propagation transfer signalling (rejection notices).
+     * Mirrors Python propagation_transfer_signalling_packet(): an
+     * ERROR_INVALID_STAMP signal cancels the associated outbound message with
+     * a REJECTED state.
+     */
+    fun propagationTransferSignallingPacket(
+        data: ByteArray,
+        @Suppress("UNUSED_PARAMETER") packet: Packet?,
+    ) {
+        try {
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            var signal = -1
+            if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.ARRAY) {
+                val header = unpacker.unpackArrayHeader()
+                if (header >= 1) signal = unpackAsInt(unpacker)
+            }
+            unpacker.close()
+            if (signal == NodeErrors.ERROR_INVALID_STAMP) {
+                println("[LXMRouter] Message rejected by propagation node (invalid stamp)")
+                // Outbound cancel-by-id plumbing lives on the client side; the
+                // failed-delivery callback path covers REJECTED signalling there.
+                processingScope.launch {
+                    failedOutboundMutex.withLock {
+                        // Nothing to mutate without the originating message reference;
+                        // retained for wire-shape parity and P4 extension.
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Error processing propagation transfer signalling: ${e.message}")
+        }
+    }
+
+    // ==================== lxmf_delivery / lxmf_propagation ====================
+
+    /**
+     * Deliver raw lxmf bytes addressed to one of OUR delivery destinations.
+     *
+     * Mirrors Python lxmf_delivery(): unpack, blackhole/duplicate/ignored-list
+     * filtering, ticket extraction, stamp validation (with enforcement
+     * switches), transport-encryption annotation, dedup registration and the
+     * external delivery callback.
+     *
+     * Deviation: phy_stats arrive embedded in the callers' Packet upstream in
+     * kt (processInboundDelivery annotates them); the explicit phyStats param
+     * is kept for API parity but only feeds rssi/snr when provided.
+     *
+     * @param noStampEnforcement accept invalid stamps (paper/temporary amnesty)
+     * @param allowDuplicate skip the duplicate filter
+     * @return true when the message was accepted and dispatched
+     */
+    fun lxmfDelivery(
+        lxmfData: ByteArray,
+        method: DeliveryMethod? = null,
+        ratchetId: ByteArray? = null,
+        noStampEnforcement: Boolean = false,
+        allowDuplicate: Boolean = false,
+        phyStatsRssi: Int? = null,
+        phyStatsSnr: Float? = null,
+    ): Boolean {
+        return try {
+            val message = LXMessage.unpackFromBytes(lxmfData, method) ?: return false
+
+            if (method != null) message.method = method
+
+            // Ticket field handling.
+            if (message.signatureValidated && message.fields.containsKey(LXMFConstants.FIELD_TICKET)) {
+                val ticketEntry = message.fields[LXMFConstants.FIELD_TICKET]
+                if (ticketEntry is List<*> && ticketEntry.size > 1) {
+                    val expires = (ticketEntry[0] as? Number)?.toLong()
+                    val ticket = ticketEntry[1] as? ByteArray
+                    if (expires != null && ticket != null &&
+                        System.currentTimeMillis() / 1000 < expires &&
+                        ticket.size == LXMFConstants.TICKET_LENGTH
+                    ) {
+                        rememberTicket(message.sourceHash.toHexString(), listOf(expires, ticket))
+                        saveAvailableTicketsAsync()
+                    }
+                }
+            }
+
+            // Stamp validation against the destination's required cost.
+            val destHashHex = message.destinationHash.toHexString()
+            val requiredCost = deliveryDestinations[destHashHex]?.stampCost
+            if (requiredCost != null) {
+                val tickets = getInboundTickets(message.sourceHash.toHexString())
+                message.validateStamp(requiredCost, tickets)
+                if (!message.stampValid) {
+                    if (noStampEnforcement) {
+                        println("[LXMRouter] Invalid stamp received, allowing (stamp enforcement temporarily disabled)")
+                    } else {
+                        println("[LXMRouter] Dropping message with invalid stamp")
+                        return false
+                    }
+                }
+            }
+
+            phyStatsRssi?.let { message.receivedRssi = it }
+
+            if (ignoredList.any { it.contentEquals(message.sourceHash) }) {
+                println("[LXMRouter] Ignored message from ${message.sourceHash.toHexString()}")
+                return false
+            }
+
+            val messageHashHex = message.hash?.toHexString()
+            if (!allowDuplicate && messageHashHex != null && hasMessage(hexToBytes(messageHashHex)!!)) {
+                println("[LXMRouter] Ignored already received message")
+                return false
+            } else if (messageHashHex != null) {
+                locallyDeliveredTransientIds[messageHashHex] = System.currentTimeMillis() / 1000
+                saveTransientIdsAsync()
+            }
+
+            deliveryCallback?.invoke(message)
+            true
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not assemble LXMF message from received data: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Ingest propagated lxmf bytes: deliver locally when addressed to us,
+     * otherwise store into the message store for later retrieval by clients.
+     *
+     * Mirrors Python lxmf_propagation(). Returns [signalLocalDelivery] /
+     * [signalDuplicate] passthroughs exactly like Python when supplied.
+     */
+    fun lxmfPropagation(
+        lxmfData: ByteArray,
+        signalLocalDelivery: Any? = null,
+        signalDuplicate: Any? = null,
+        allowDuplicate: Boolean = false,
+        isPaperMessage: Boolean = false,
+        stampValue: Int? = null,
+        stampData: ByteArray? = null,
+    ): Boolean {
+        val noStampEnforcement = isPaperMessage
+        return try {
+            if (lxmfData.size < LXMFConstants.LXMF_OVERHEAD) return false
+
+            val transientId = Hashes.fullHash(lxmfData)
+            val transientIdHex = transientId.toHexString()
+
+            if ((!propagationEntries.containsKey(transientIdHex) &&
+                    !locallyProcessedTransientIds.containsKey(transientIdHex)) ||
+                allowDuplicate
+            ) {
+                val received = System.currentTimeMillis() / 1000
+                val destinationHash = lxmfData.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
+                locallyProcessedTransientIds[transientIdHex] = received
+
+                val deliveryDestination = deliveryDestinations[destinationHash.toHexString()]
+                if (deliveryDestination != null) {
+                    // Addressed to us: decrypt, deliver, record delivered id.
+                    val encrypted = lxmfData.copyOfRange(LXMFConstants.DESTINATION_LENGTH, lxmfData.size)
+                    val decrypted = deliveryDestination.destination.decrypt(encrypted)
+                    if (decrypted != null) {
+                        val deliveryData = destinationHash + decrypted
+                        val delivered =
+                            lxmfDelivery(
+                                deliveryData,
+                                method = DeliveryMethod.PROPAGATED,
+                                noStampEnforcement = noStampEnforcement,
+                                allowDuplicate = allowDuplicate,
+                            )
+                        if (delivered) {
+                            locallyDeliveredTransientIds[transientIdHex] = System.currentTimeMillis() / 1000
+                            saveTransientIdsAsync()
+                        }
+                        if (signalLocalDelivery != null) {
+                            @Suppress("UNCHECKED_CAST")
+                            return (signalLocalDelivery as Boolean)
+                        }
+                    } else {
+                        println("[LXMRouter] Failed to decrypt locally-addressed propagated message")
+                        return false
+                    }
+                } else if (propagationNodeEnabled) {
+                    // Store for clients.
+                    val dir = messageStoreDir
+                    if (dir == null) {
+                        println("[LXMRouter] Message store unavailable; dropping propagated message")
+                        return false
+                    }
+                    val stampedData = stampData?.let { lxmfData + it } ?: lxmfData
+                    val valueComponent = if (stampValue != null && stampValue > 0) "_$stampValue" else ""
+                    val filePath = "${dir.absolutePath}/${transientIdHex}_$received$valueComponent"
+                    File(filePath).writeBytes(stampedData)
+
+                    propagationEntries[transientIdHex] =
+                        PropagationEntry(
+                            destinationHash = destinationHash,
+                            filePath = filePath,
+                            receivedSeconds = System.currentTimeMillis() / 1000,
+                            sizeBytes = stampedData.size.toLong(),
+                            stampValue = stampValue ?: 0,
+                        )
+                    // PEER-P4: Python enqueues into peer distribution queues here.
+                } else {
+                    println("[LXMRouter] Not hosting a propagation node; discarding propagated message")
+                    return false
+                }
+
+                return true
+            } else {
+                if (signalDuplicate != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    return (signalDuplicate as Boolean)
+                }
+                false
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not assemble propagated LXMF message from received data: ${e.message}")
+            false
+        }
+    }
+
+    // ==================== Sync completion / path job ====================
+
+    /**
+     * Reset propagation-transfer bookkeeping after a sync attempt.
+     * Mirrors Python acknowledge_sync_completion(reset_state, failure_state).
+     */
+    fun acknowledgeSyncCompletion(
+        resetState: Boolean = false,
+        failureState: PropagationTransferState? = null,
+    ) {
+        propagationTransferLastResult = 0
+        if (resetState || propagationTransferState.ordinal <= PropagationTransferState.COMPLETE.ordinal) {
+            propagationTransferState = failureState ?: PropagationTransferState.IDLE
+        }
+        propagationTransferProgress = 0.0
+        wantsDownloadOnPathAvailableFrom = null
+        wantsDownloadOnPathAvailableTo = null
+    }
+
+    /**
+     * Background wait for a propagation node path, then start the download.
+     *
+     * Deviation: Python's daemon thread (`request_messages_path_job`) polling
+     * RNS.Transport.has_path becomes a cancellable coroutine polling at
+     * 100ms until PR_PATH_TIMEOUT_SECONDS elapses.
+     */
+    fun requestMessagesPathJob() {
+        requestMessagesPathJob?.cancel()
+        requestMessagesPathJob =
+            processingScope.launch {
+                val target = wantsDownloadOnPathAvailableFrom ?: return@launch
+                val timeoutAt = wantsDownloadOnPathAvailableTimeoutSeconds * 1000
+                while (!Transport.hasPath(target) && System.currentTimeMillis() < timeoutAt) {
+                    delay(100)
+                }
+                if (Transport.hasPath(target)) {
+                    requestMessagesFromPropagationNode()
+                } else {
+                    println("[LXMRouter] Propagation node path request timed out")
+                    propagationTransferState = PropagationTransferState.NO_PATH
+                    acknowledgeSyncCompletion(failureState = PropagationTransferState.NO_PATH)
+                }
+            }
+    }
+
+    /** Arm the path-wait bookkeeping used by [requestMessagesPathJob]. */
+    fun armPathWait(targetHash: ByteArray) {
+        wantsDownloadOnPathAvailableFrom = targetHash
+        wantsDownloadOnPathAvailableTimeoutSeconds = System.currentTimeMillis() / 1000 + PR_PATH_TIMEOUT_SECONDS
+    }
+
+    // ==================== Persistence: node-side caches ====================
+
+    /**
+     * Persist locally delivered transient IDs atomically.
+     * Mirrors Python save_locally_delivered_transient_ids(); the async
+     * saveTransientIdsAsync already covers the periodic path — this is the
+     * explicit synchronous form used by sync completion and tests.
+     */
+    fun saveLocallyDeliveredTransientIds() {
+        val path = storagePath ?: return
+        if (locallyDeliveredTransientIds.isEmpty()) return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+            val writePath = File(dir, "local_deliveries")
+            val tmpPath = File(dir, "local_deliveries.tmp.${System.currentTimeMillis()}")
+            tmpPath.writeBytes(packTransientIdMap(locallyDeliveredTransientIds))
+            if (!tmpPath.renameTo(writePath)) {
+                writePath.writeBytes(tmpPath.readBytes())
+                tmpPath.delete()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save locally delivered message ID cache: ${e.message}")
+        }
+    }
+
+    /** Persist locally processed transient IDs atomically (Python save_locally_processed_transient_ids). */
+    fun saveLocallyProcessedTransientIds() {
+        val path = storagePath ?: return
+        if (locallyProcessedTransientIds.isEmpty()) return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+            val writePath = File(dir, "locally_processed")
+            val tmpPath = File(dir, "locally_processed.tmp.${System.currentTimeMillis()}")
+            tmpPath.writeBytes(packTransientIdMap(locallyProcessedTransientIds))
+            if (!tmpPath.renameTo(writePath)) {
+                writePath.writeBytes(tmpPath.readBytes())
+                tmpPath.delete()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save locally processed ID cache: ${e.message}")
+        }
+    }
+
+    /** Persist node statistics atomically (Python save_node_stats). */
+    fun saveNodeStats() {
+        val path = storagePath ?: return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+            val buffer = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(buffer)
+            packer.packMapHeader(4)
+            packer.packString("client_propagation_messages_received"); packer.packLong(clientPropagationMessagesReceived)
+            packer.packString("client_propagation_messages_served"); packer.packLong(clientPropagationMessagesServed)
+            packer.packString("unpeered_propagation_incoming"); packer.packLong(unpeeredPropagationIncoming)
+            packer.packString("unpeered_propagation_rx_bytes"); packer.packLong(unpeeredPropagationRxBytes)
+            packer.close()
+
+            val writePath = File(dir, "node_stats")
+            val tmpPath = File(dir, "node_stats.tmp.${System.currentTimeMillis()}")
+            tmpPath.writeBytes(buffer.toByteArray())
+            if (!tmpPath.renameTo(writePath)) {
+                writePath.writeBytes(tmpPath.readBytes())
+                tmpPath.delete()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save local node stats: ${e.message}")
+        }
+    }
+
+    private fun loadNodeStats() {
+        val path = storagePath ?: return
+        val file = File(path, "lxmf/node_stats")
+        if (!file.exists()) return
+        try {
+            val unpacker = MessagePack.newDefaultUnpacker(file.readBytes())
+            val mapSize = unpacker.unpackMapHeader()
+            for (i in 0 until mapSize) {
+                when (unpacker.unpackString()) {
+                    "client_propagation_messages_received" -> clientPropagationMessagesReceived = unpacker.unpackLong()
+                    "client_propagation_messages_served" -> clientPropagationMessagesServed = unpacker.unpackLong()
+                    "unpeered_propagation_incoming" -> unpeeredPropagationIncoming = unpacker.unpackLong()
+                    "unpeered_propagation_rx_bytes" -> unpeeredPropagationRxBytes = unpacker.unpackLong()
+                    else -> unpacker.skipValue()
+                }
+            }
+            unpacker.close()
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not load local node stats: ${e.message}")
+        }
+    }
+
+    private fun packTransientIdMap(map: ConcurrentHashMap<String, Long>): ByteArray {
+        val buffer = ByteArrayOutputStream()
+        val packer = MessagePack.newDefaultPacker(buffer)
+        packer.packMapHeader(map.size)
+        for ((hexHash, timestamp) in map) {
+            val hashBytes = hexToBytes(hexHash)!!
+            packer.packBinaryHeader(hashBytes.size)
+            packer.writePayload(hashBytes)
+            packer.packLong(timestamp)
+        }
+        packer.close()
+        return buffer.toByteArray()
+    }
+
+    // ==================== Housekeeping jobs ====================
+
+    /**
+     * Tear down inactive direct and propagation links.
+     * Mirrors Python clean_links() minus peer-link bookkeeping (PEER-P4).
+     */
+    fun cleanLinks() {
+        val closed = mutableListOf<String>()
+        for ((destHashHex, link) in directLinks) {
+            if (link.noDataFor() > LINK_MAX_INACTIVITY_MS) {
+                try {
+                    link.teardown()
+                } catch (_: Exception) {
+                }
+                closed.add(destHashHex)
+            }
+        }
+        for (key in closed) directLinks.remove(key)
+
+        synchronized(activePropagationLinks) {
+            val inactive =
+                activePropagationLinks.filter { it.noDataFor() > P_LINK_MAX_INACTIVITY_MS }
+            for (link in inactive) {
+                activePropagationLinks.remove(link)
+                try {
+                    link.teardown()
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        val outbound = outboundPropagationLink
+        if (outbound != null && outbound.status == LinkConstants.CLOSED) {
+            outboundPropagationLink = null
+            when {
+                propagationTransferState == PropagationTransferState.COMPLETE ->
+                    acknowledgeSyncCompletion()
+                propagationTransferState.ordinal < PropagationTransferState.LINK_ESTABLISHED.ordinal ->
+                    acknowledgeSyncCompletion(failureState = PropagationTransferState.FAILED)
+                else ->
+                    acknowledgeSyncCompletion(failureState = PropagationTransferState.FAILED)
+            }
+            println("[LXMRouter] Cleaned outbound propagation link")
+        }
+    }
+
+    /**
+     * Drop finished inbound delivery-resource trackers.
+     * Mirrors Python clean_resource_tracking() over the kt equivalent map
+     * ([pendingResources]).
+     */
+    fun cleanResourceTracking() {
+        try {
+            val stale = pendingResources.filterValues { (_, resource) -> resource.status >= ResourceConstants.COMPLETE }.keys
+            stale.forEach { pendingResources.remove(it) }
+            if (stale.isNotEmpty()) println("[LXMRouter] Cleaned ${stale.size} resource(s) from inbound tracking")
+        } catch (e: Exception) {
+            println("[LXMRouter] Error while cleaning inbound resource tracking: ${e.message}")
+        }
+    }
+
+    /** Expire throttle entries (Python clean_throttled_peers). */
+    fun cleanThrottledPeers() {
+        val now = System.currentTimeMillis() / 1000
+        throttledPeers.entries.removeIf { now > it.value }
+    }
+
+    /**
+     * Flush queued distributions to peers. PEER-P4: with no peer table the
+     * queue is definitionally empty; kept as an explicit no-op so the job
+     * scheduler shape matches Python.
+     */
+    fun flushQueues() {
+        // No-op until P4 lands the peer distribution queue.
+    }
+
+    /**
+     * Extend the periodic processing loop with node-side job cadences
+     * (the coroutine replacement for Python jobs()/jobloop()).
+     * Called from [start]'s loop.
+     */
+    private fun runNodeJobs() {
+        if (processingCount % JOB_LINKS_INTERVAL_TICKS == 0L) cleanLinks()
+        if (processingCount % JOB_RESOURCE_INTERVAL_TICKS == 0L) cleanResourceTracking()
+        if (processingCount % JOB_STORE_INTERVAL_TICKS == 0L && propagationNodeEnabled) cleanMessageStore()
+        if (processingCount % JOB_PEERSYNC_INTERVAL_TICKS == 0L) {
+            if (propagationNodeEnabled) flushQueues()
+            cleanThrottledPeers()
+        }
+    }
+
+    // ==================== Msgpack helpers (node side) ====================
+
+    /** Encode an arbitrary node-handler response value (int/list/map/boolean/null) as msgpack bytes. */
+    private fun encodeMsgpackValue(value: Any?): ByteArray? {
+        if (value == null) return null
+        val buffer = ByteArrayOutputStream()
+        val packer = MessagePack.newDefaultPacker(buffer)
+        packMsgpackValue(packer, value)
+        packer.close()
+        return buffer.toByteArray()
+    }
+
+    private fun packMsgpackValue(
+        packer: org.msgpack.core.MessagePacker,
+        value: Any?,
+    ) {
+        when (value) {
+            null -> packer.packNil()
+            is Int -> packer.packInt(value)
+            is Long -> packer.packLong(value)
+            is Boolean -> packer.packBoolean(value)
+            is String -> packer.packString(value)
+            is ByteArray -> {
+                packer.packBinaryHeader(value.size); packer.writePayload(value)
+            }
+            is List<*> -> {
+                packer.packArrayHeader(value.size)
+                for (item in value) packMsgpackValue(packer, item)
+            }
+            is Map<*, *> -> {
+                packer.packMapHeader(value.size)
+                for ((k, v) in value) {
+                    packMsgpackValue(packer, k.toString())
+                    packMsgpackValue(packer, v)
+                }
+            }
+            else -> {
+                packer.packString(value.toString())
+            }
+        }
+    }
+
+    /** Read a msgpack list-of-binaries-or-nil element (wants/haves fields). */
+    private fun unpackMsgpackIdListOrNul(unpacker: org.msgpack.core.MessageUnpacker): List<ByteArray>? {
+        if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.NIL) {
+            unpacker.skipValue()
+            return null
+        }
+        val count = unpacker.unpackArrayHeader()
+        val result = mutableListOf<ByteArray>()
+        for (i in 0 until count) {
+            val len = unpacker.unpackBinaryHeader()
+            result.add(ByteArray(len).also { unpacker.readPayload(it) })
+        }
+        return result
+    }
+
+    private fun hexToBytesOrNull(hex: String): ByteArray? = try { hexToBytes(hex) } catch (_: Exception) { null }
+
+    /** Unpack a msgpack value as Int, tolerating float encoding. */
     private fun unpackAsLong(unpacker: org.msgpack.core.MessageUnpacker): Long =
         when (unpacker.nextFormat.valueType) {
             org.msgpack.value.ValueType.INTEGER -> unpacker.unpackLong()
