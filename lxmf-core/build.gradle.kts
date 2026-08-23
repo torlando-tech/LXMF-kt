@@ -48,6 +48,11 @@ dependencies {
 
     // Compression - Apache Commons Compress for BZ2 interop tests
     testImplementation("org.apache.commons:commons-compress:1.26.0")
+
+    // QR encoding for PAPER message representation (LXMessage.asQr).
+    // Python LXMF uses the optional third-party "qrcode" module; zxing core
+    // is the JVM equivalent (deviation documented in port-deviations.md).
+    implementation("com.google.zxing:core:3.5.3")
 }
 
 // Exclude the `interop` test suite from the default `test` task. These tests
