@@ -105,6 +105,14 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 
 **Date:** 2026-08-23
 
+### `LXMessage.destination`/`source` set-once via named setters, not property assignment — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::setDestination` / `::setSource`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:224-262` (`destination`/`source` properties + `set_destination()`/`set_source()`)
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
 **Tracking:** P3 parity card t_a3c5bdbc
 
 **Description:** reticulum-kt keeps `Packet.link` internal to rns-core (`getLink$rns_core()` is module-private), so a caller outside rns-core cannot read the owning link off an inbound packet as Python does. The kotlin `propagationPacket(data, packet, link)` therefore takes the link as an extra parameter supplied by `propagationLinkEstablished`'s `setPacketCallback`, and uses it for the invalid-stamp `teardown()`. Semantics are unchanged: Python's null-link early return maps to a null `link` parameter.
@@ -114,11 +122,13 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 ### validate_pn_stamps_job_multip process-pool replaced by sequential validation — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXStamper.kt::validatePnStamps`
 
 **Python reference:** `LXMF/LXStamper.py:validate_pn_stamps_job_multip` (multiprocessing.Pool fan-out over `validate_pn_stamp`).
+**Description:** Python exposes `destination`/`source` as mutable properties whose setter delegates to the guarded `set_destination()`, so `lxm.destination = d` and `lxm.set_destination(d)` are equivalent. Kotlin constructor-injected `val`s back these fields; making them publicly assignable `var`s would bypass python's set-once guard (ValueError on reassign, ValueError on non-Destination). The port keeps them read-only (`private set`) and adds `setDestination()`/`setSource()` which replicate the guard exactly: fill-once when null, `IllegalArgumentException` on reassignment.
 
-**Category:** language/runtime forced
+**Re-evaluation:** A Kotlin custom setter with backing-field sentinel could allow `msg.destination = d` syntax while keeping the guard; revisit if API ergonomics demand property-style assignment.
 
-**Date:** 2026-08-23
+### `get_propagation_stamp` derives `transient_id` inside LXMessage — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::getPropagationStamp`
 
+**Python reference:** `LXMF/LXMF/LXMessage.py:329-353` (`get_propagation_stamp`) with transient synthesis at `LXMessage.py:429-435` (inside `pack()`'s PROPAGATED branch)
 **Tracking:** P3 parity card t_a3c5bdbc
 
 **Description:** Python validates incoming propagation batches in a multiprocessing pool for CPU parallelism. On the JVM the same structured-concurrency substitution used elsewhere in this port applies: `validatePnStamps` validates sequentially on the caller's dispatcher via `mapNotNull`. Per-entry results are identical (`null` drops); only wall-clock throughput of large batch validations differs.
@@ -146,3 +156,43 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 9. `update_stamp_cost` remains private with hex-string key
    Already existed pre-P2 (semantic parity incl. async save); no public wrapper added
    because Python callers reach it only through announce handling.
+=======
+**Description:** Python's `pack()` computes `self.transient_id` (and `propagation_packed`) only in its PROPAGATED desired-method branch. The kotlin `pack()` predates full PROPAGATED packing (transient synthesis lives in `LXMRouter.sendViaPropagation`), so `getPropagationStamp()` cannot rely on `pack()` having produced a `transient_id`. It therefore derives it itself — `full_hash(destHash + encrypt(packed[DESTINATION_LENGTH:]))`, byte-identical to both python's formula and LXMRouter's — when absent after packing. Semantics match python exactly; only the code location differs.
+
+**Re-evaluation:** If kotlin `pack()` ever ports python's full PROPAGATED branch (including `__pn_encrypted_data` caching), remove the local derivation here.
+
+### `get_propagation_stamp` returns stamp via return value + state fields instead of tuple — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::getPropagationStamp`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:345-350`
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Description:** Python returns `(generated_stamp, value)` from `LXStamper.generate_stamp` and assigns two attributes. Kotlin's `LXStamper` already models this as `StampResult(stamp, value, rounds)`; `getPropagationStamp()` returns only the stamp bytes (matching python's own public return type) and stores value/validity in `propagationStampValue`/`propagationStampValid`. No behavioral difference.
+
+**Re-evaluation:** None needed — pure type-shape adaptation.
+
+### `as_qr` uses zxing core instead of the optional `qrcode` module, returning a Boolean matrix — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::asQr` + `QrEncoder.kt`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:718-744`
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Description:** Python lazily imports the optional third-party `qrcode` module, renders a PIL image with `ERROR_CORRECT_L` and border 1, and returns `None` (with CRITICAL log) if the module is missing. The JVM equivalent is zxing's QR encoder; lxmf-core depends on `com.google.zxing:core` (compile scope, no transitive image deps) and wraps it in `QrEncoder`, exposing the result as a plain `Boolean` matrix (true = dark module) rather than an image type so lxmf-core stays graphics-free. Error correction level, border=1, UTF-8 data and the TypeError-equivalent for non-paper messages all match. Unlike python, the encoder is always present, so null only occurs on internal encoding failure.
+
+**Re-evaluation:** If a future consumer needs drop-in PIL-equivalent rendering, add a rendering adapter at the platform layer (Android Bitmap / java.awt), not in lxmf-core.
+
+### `write_to_directory` temp-file suffix uses PID + SecureRandom instead of `os.getpid() or time.time()` + urandom(8) — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::writeToDirectory`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:674-696`
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Description:** Python builds `<file>.tmp.<pid>.<8 random bytes hex>`; the JVM has no direct urandom-hex helper, so the port uses `ProcessHandle.current().pid()` plus 8 bytes from `SecureRandom` hex-encoded — same collision-resistance, same atomic-rename persistence protocol (`Files.move` with ATOMIC_MOVE replacing python's `os.replace`). Python's fsync is approximated by `File.writeBytes` + OS-level rename durability guarantees; explicit fsync is skipped because the JVM `FileChannel.force` path would add complexity for identical practical durability on the target platforms (Linux/Android ext4/f2fs).
+
+**Re-evaluation:** If strict fsync parity is later required (e.g. embedded flash wear analysis), switch to FileChannel.write + force(true) before the move.
