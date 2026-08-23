@@ -74,3 +74,51 @@ The re-request is therefore relocated to the `closedCallback`, where kotlin actu
 This matters specifically for transport-enabled nodes: reticulum-kt's `Transport.deregisterLink` stale-path recovery (expire + re-request on pending-link timeout) is intentionally gated to non-transport nodes (Python `Transport.py:504` parity), so for transport-mode users the LXMF close-time re-request is the only mechanism that refreshes a stale path after a failed DIRECT link.
 
 **Re-evaluation:** If the kotlin `LXMRouter` ever stops eagerly removing the link in `closedCallback` and instead lets `processDirectDelivery` observe and pop CLOSED links (matching Python's `direct_links` lifecycle), move the re-request back into the CLOSED branch and delete this deviation. The per-message `pathRequestRetried` semantics would then align 1:1 with Python without the close-event approximation.
+
+### LXMPeer port — thread-model divergence: blocking path-request grace + off-thread peering-key generation
+
+**Python reference:** `LXMF/LXMF/LXMPeer.py` `sync()` lines 295-298 (`time.sleep(PATH_REQUEST_GRACE)`), line 284-286 (`threading.Thread(target=job, daemon=True).start()` for key generation).
+
+**Category:** language/runtime forced (deliberate, documented)
+
+**Date:** 2026-08-23
+
+**Description:** Python's sync runs inside a dedicated router job thread where a 7.5 s `time.sleep()` after `Transport.request_path` is acceptable. The Kotlin port keeps the same blocking grace sleep inside `LXMPeer.sync()` because callers (`syncPeers`, link-established callback) already run on background threads/coroutine dispatchers; a non-blocking rewrite would change call-flow semantics. Peering-key generation is dispatched to a daemon thread exactly as Python does. Callers embedding this in coroutine contexts should wrap `sync()` in `Dispatchers.IO`.
+
+**Re-evaluation:** Convert to suspending path-request await if LXMRouter's job scheduler ever moves peer sync onto the shared processingScope.
+
+### LXMPeer port — `link_establishment_rate` unit divergence
+
+**Python reference:** `LXMPeer.py` `link_established` line 536 (`link.get_establishment_rate()` returns bytes/ms-derived value).
+
+**Category:** upstream API difference (rns-kt)
+
+**Date:** 2026-08-23
+
+**Description:** rns-kt `Link.getEstablishmentRate()` converts its internal bytes/ms figure to bits/second before returning (`Link.kt:3442`). The stored `linkEstablishmentRate` field therefore carries bits/s rather than Python's raw rate. This affects only the fastest-peer sort ordering scale (relative order is preserved) and log output.
+
+**Re-evaluation:** If cross-language parity of the stored number matters (e.g. shared stats files), divide by 8 at the call site and document the storage unit.
+
+### LXMPeer port — `process_queues` stale-snapshot duplicate suppression preserved verbatim
+
+**Python reference:** `LXMPeer.py` `process_queues` lines 557-572.
+
+**Category:** semantic parity decision (no deviation)
+
+**Date:** 2026-08-23
+
+**Description:** Python snapshots `handled_messages`/`unhandled_messages` BEFORE draining the queues, so an id queued simultaneously as handled and unhandled passes the unhandled queue's suppression check against the stale snapshot and lands in BOTH live sets. The Kotlin port reproduces this exact behavior (verified by test) rather than "fixing" it — flagged here so future readers know it is intentional parity, not a bug.
+
+**Re-evaluation:** Only revisit if upstream changes process_queues semantics.
+
+### LXMPeer port — msgpack number decoding tolerant of int/float encodings
+
+**Python reference:** `from_bytes` reads dict values with dynamic typing.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-08-23
+
+**Description:** Kotlin msgpack values are typed at decode time; Python floats round-trip as msgpack floats while counters encode as ints. `fromBytes` decodes every numeric field through an int-or-float-tolerant helper so peers serialised by either implementation load correctly. Wire format itself is unchanged from Python (`to_bytes` field names/ordering identical).
+
+**Re-evaluation:** None needed.
