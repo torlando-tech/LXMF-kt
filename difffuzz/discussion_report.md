@@ -90,3 +90,9 @@ Fix direction: build the transfer index from exactly the entries whose bytes ent
 All outputs above come from the attached script (`verify_upstream_flaws.py`): it builds a real `LXMRouter` with propagation enabled, seeds four deterministic store entries, constructs a real `LXMPeer`, and invokes `offer_response()` directly with crafted request receipts — only the transport layer (`RNS.Resource`) is stubbed to capture payloads. Runs offline in ~5 s against a stock checkout. Happy to provide it inline if attachments are awkward here.
 
 For reference, the Kotlin port has shipped fixes for Flaws 1–3 (bounded+deduped selection, transferred-only bookkeeping) in [PR #38](https://github.com/torlando-tech/LXMF-kt/pull/38), including a differential fuzzer (`difffuzz/`) that drives adversarial offer replies through real RNS links against both implementations — happy to upstream any of it if useful.
+
+---
+
+*Addendum (2026-08-24): the verification script and findings above were
+submitted upstream to markqvist via direct email, referencing this repo's
+`difffuzz/` rig. The Kotlin-side fixes are in PR torlando-tech/LXMF-kt#38.*
