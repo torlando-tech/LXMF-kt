@@ -896,6 +896,167 @@ private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
 // Dispatch
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Differential-fuzz instrumentation (fz_*) — passive victim-side hooks.
+//
+// Mirrors difffuzz/fuzz_bridge.py on the Python side. These commands are
+// INSTRUMENTATION ONLY: no adversarial payload crafting happens here.
+// The attacker role is always played by the Python fuzz bridge, which
+// wraps the reference /offer request handler. With these hooks either
+// implementation can serve as the victim whose OFFER RESPONSE processor
+// is under test (the surface where PR#38's Greptile P1 lives).
+// ----------------------------------------------------------------------
+
+private fun fzTruncatedHash(data: ByteArray): ByteArray =
+    java.security.MessageDigest.getInstance("SHA-256").digest(data).copyOfRange(0, 16)
+
+private fun cmdFzSeedStore(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_seed_store")
+
+    // enablePropagation() CLEARS and re-indexes the store, so it must run
+    // BEFORE seeding. Idempotent when already enabled.
+    if (!router.propagationNodeEnabled) router.enablePropagation()
+    val propDest = router.propagationDestination
+        ?: throw IllegalStateException("enablePropagation did not register a propagation destination")
+
+    val count = params.optInt("count", 4)
+    val size = params.optInt("size", 512)
+    val seed = params.optString("seed", "fuzz")
+    val unhandledFor = hexToBytes(params.getString("unhandled_for"))
+    if (unhandledFor.size != 16) {
+        throw IllegalArgumentException("unhandled_for must be a 16-byte propagation destination hash")
+    }
+
+    val storagePath = BridgeState.storagePath
+        ?: throw IllegalStateException("lxmf_init produced no storage path")
+    val msgDir = File(storagePath, "lxmf/messagestore").apply { mkdirs() }
+    val fillerDest = ByteArray(16)
+    val receivedSeconds = System.currentTimeMillis() / 1000L
+    val created = JSONArray()
+
+    for (i in 0 until count) {
+        val tid = fzTruncatedHash("$seed:$i".toByteArray(Charsets.UTF_8))
+        val data: ByteArray = fillerDest +
+            ByteArray(80) +
+            byteArrayOf(0xC3.toByte()) +
+            ByteArray(size) { 'B'.code.toByte() }
+        // Filename convention matches Python: <tid_hex>_<received_seconds>
+        val fpath = File(msgDir, "${tid.toHexString()}_$receivedSeconds")
+        fpath.writeBytes(data)
+
+        router.propagationEntriesMap[tid.toHexString()] = LXMRouter.PropagationEntry(
+            dstHash = fillerDest,
+            filePath = fpath.absolutePath,
+            receivedAt = receivedSeconds.toDouble(),
+            size = data.size,
+            stampValue = 0,
+            unhandledBy = mutableListOf(unhandledFor),
+        )
+        created.put(tid.toHexString())
+    }
+
+    return JSONObject()
+        .put("seeded", count)
+        .put("transient_ids", created)
+        .put("propagation_destination_hash", propDest.hash.toHexString())
+}
+
+private fun cmdFzDumpState(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_dump_state")
+
+    val entries = JSONObject()
+    for ((tidHex, e) in router.propagationEntriesMap) {
+        val handledBy = JSONArray()
+        for (p in e.handledBy) handledBy.put(p.toHexString())
+        val unhandledBy = JSONArray()
+        for (p in e.unhandledBy) unhandledBy.put(p.toHexString())
+        entries.put(
+            tidHex,
+            JSONObject()
+                .put("size", e.size)
+                .put("handled_peers", handledBy)
+                .put("unhandled_peers", unhandledBy)
+        )
+    }
+
+    val peersOut = JSONObject()
+    for (peer in router.getPeers()) {
+        val transferring = JSONArray()
+        peer.currentlyTransferringMessages?.forEach { transferring.put(it.toHexString()) }
+        peersOut.put(
+            peer.destinationHash.toHexString(),
+            JSONObject()
+                .put("state", peer.state)
+                .put("offered", peer.offered)
+                .put("outgoing", peer.outgoing)
+                .put("incoming", peer.incoming)
+                .put("currently_transferring", transferring)
+        )
+    }
+
+    val sinceSeq = params.optInt("since_seq", 0)
+    val messages = JSONArray()
+    var lastSeq: Int
+    BridgeState.inboxLock.withLock {
+        for (m in BridgeState.inbox) {
+            if (m.getInt("seq") > sinceSeq) messages.put(m)
+        }
+        lastSeq = BridgeState.inboxSeq
+        Unit
+    }
+
+    return JSONObject()
+        .put(
+            "propagation_destination_hash",
+            router.propagationDestination?.hash?.toHexString() ?: ""
+        )
+        .put("entry_count", router.propagationEntriesMap.size)
+        .put("entries", entries)
+        .put("peers", peersOut)
+        .put("inbox", JSONObject().put("messages", messages).put("last_seq", lastSeq))
+}
+
+private fun cmdFzPeer(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_peer")
+    val dhashHex = params.getString("destination_hash")
+    val cost = params.optInt("peering_cost", 1)
+
+    // Router-level cost governs inbound key validation; per-peer cost
+    // governs outbound key minting. Both pinned so PoW is instant and
+    // both directions accept cost-1 keys.
+    router.peeringCost = cost
+
+    // addStaticPeer creates the entry if missing and never auto-culls it.
+    router.addStaticPeer(dhashHex)
+    val peer = router.getPeers().firstOrNull { it.destinationHash.toHexString() == dhashHex }
+        ?: throw IllegalStateException("addStaticPeer did not produce a peering entry")
+    peer.peeringCost = cost
+    // Pin the outbound stamp-cost knowledge too — sync() postpones while
+    // propagationStampCost/Flexibility are null (mirrors Python).
+    peer.propagationStampCost = 1
+    peer.propagationStampCostFlexibility = 1
+
+    return JSONObject().put("ok", true).put("peered", dhashHex).put("peering_cost", cost)
+}
+
+private fun cmdFzSetPeeringCost(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_set_peering_cost")
+    val cost = params.getInt("cost")
+    router.peeringCost = cost
+    for (peer in router.getPeers()) peer.peeringCost = cost
+    return JSONObject().put("peering_cost", cost)
+}
+
+private fun cmdFzSyncPeers(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_sync_peers")
+    var n = 0
+    for (peer in router.getPeers()) {
+        peer.sync()
+        n++
+    }
+    return JSONObject().put("triggered", true).put("peers", n)
+}
+
 private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_init" to ::cmdLxmfInit,
     "lxmf_add_tcp_server_interface" to ::cmdLxmfAddTcpServerInterface,
@@ -913,6 +1074,12 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_get_message_progress" to ::cmdLxmfGetMessageProgress,
     "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
+    // Differential-fuzz instrumentation (see comments above the handlers)
+    "fz_seed_store" to ::cmdFzSeedStore,
+    "fz_dump_state" to ::cmdFzDumpState,
+    "fz_peer" to ::cmdFzPeer,
+    "fz_set_peering_cost" to ::cmdFzSetPeeringCost,
+    "fz_sync_peers" to ::cmdFzSyncPeers,
 )
 
 private fun handleRequest(line: String): JSONObject {
