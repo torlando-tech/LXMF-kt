@@ -263,6 +263,31 @@ where nothing could be read completes without marking anything handled.
 suite + difffuzz. If upstream python fixes the same divergence, this
 becomes parity.
 
+### Persistent-strategy re-offers entries with permanently-unreadable files (inherited reference behavior — NOT diverged)
+
+**Python reference:** `LXMF/LXMPeer.py:523-524` (`resource_concluded`
+persistent re-sync) + missing-file skip at 458-468
+
+**Category:** inherited upstream behavior (kept for parity; flagged for
+possible upstream robustness report)
+
+**Date:** 2026-08-24
+
+**Description:** With the bookkeeping fix above, an entry whose backing
+file is permanently unreadable stays unhandled forever, and the persistent
+sync strategy immediately starts another sync round whenever unhandled
+messages remain (`if (unhandledMessageCount > 0) sync()`). A corrupted
+store therefore produces an endless slow retry loop (bounded by link RTT,
+no retry cap) in BOTH implementations — python has the identical property.
+Greptile r3 flagged this on the Kotlin side only because it reviews one
+implementation in isolation.
+
+**Re-evaluation:** Deliberately NOT "fixed" — capping retries or
+dead-lettering unsendable entries would change sync semantics vs the
+reference. If this ever gets a real-world trigger (store corruption in
+production), the right fix is upstream in both implementations: a retry
+cap or dead-letter table. Tracked as an upstream-report candidate.
+
 ### Offer-response selection is bounded by the current offer (hardened beyond reference) — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMPeer.kt::offerResponse`
 
 **Python reference:** `LXMF/LXMPeer.py:448-452` (`offer_response`, WantedIds branch)
