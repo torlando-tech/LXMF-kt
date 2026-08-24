@@ -242,6 +242,27 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 
 **Re-evaluation:** None needed.
 
+### Transfer bookkeeping tracks actually-sent entries only (hardened beyond reference) — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMPeer.kt::offerResponse/resourceConcluded`
+
+**Python reference:** `LXMF/LXMPeer.py:458-468` (`offer_response` payload build) vs `LXMF/LXMPeer.py:500-502` (`resource_concluded`)
+
+**Category:** deliberate hardening (correctness fix, diverges from reference)
+
+**Date:** 2026-08-24
+
+**Description:** Python builds the transfer payload by skipping entries
+whose backing files are unreadable, but keeps the FULL wanted-ID list in
+`currently_transferring_messages`; completion then marks every ID handled
+— including messages whose bytes never left the node. A missing/corrupt
+store file therefore permanently suppresses that message for the peer.
+The Kotlin port now tracks `transferredIds` (entries whose bytes actually
+entered the Resource) and keys all completion bookkeeping off it; a sync
+where nothing could be read completes without marking anything handled.
+
+**Re-evaluation:** Found by Greptile PR#38 re-review; verified by unit
+suite + difffuzz. If upstream python fixes the same divergence, this
+becomes parity.
+
 ### Offer-response selection is bounded by the current offer (hardened beyond reference) — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMPeer.kt::offerResponse`
 
 **Python reference:** `LXMF/LXMPeer.py:448-452` (`offer_response`, WantedIds branch)

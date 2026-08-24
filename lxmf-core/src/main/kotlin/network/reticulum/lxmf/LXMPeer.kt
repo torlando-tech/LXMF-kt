@@ -667,12 +667,31 @@ class LXMPeer(
                 println("[LXMPeer] Peer ${prettyHexRep(destinationHash)} wanted ${wantedMessages.size} of the available messages")
 
                 val lxmList = mutableListOf<ByteArray>()
-                for (messageEntry in wantedMessages) {
+                val transferredIds = mutableListOf<ByteArray>()
+                for (entryIndex in wantedMessages.indices) {
+                    val messageEntry = wantedMessages[entryIndex]
                     val filePath = messageEntry.filePath ?: continue
                     val file = java.io.File(filePath)
                     if (file.isFile) {
                         lxmList.add(file.readBytes())
+                        // Track only entries whose bytes actually made it into
+                        // the payload. Completion bookkeeping (handled/unhandled
+                        // flips, counters) must never include an entry that was
+                        // omitted — otherwise a missing/corrupt store file would
+                        // permanently mark an unsent message as delivered.
+                        // (Greptile PR#38 re-review finding; python reference
+                        // has the same divergence — hardened beyond upstream.)
+                        transferredIds.add(wantedMessageIds[entryIndex])
                     }
+                }
+
+                if (transferredIds.isEmpty()) {
+                    println("[LXMPeer] Peer ${prettyHexRep(destinationHash)} wanted ${wantedMessages.size} messages, but none could be read from the message store")
+                    offered += lastOffer.size
+                    link?.teardown()
+                    link = null
+                    state = IDLE
+                    return
                 }
 
                 val packer = MessagePack.newDefaultBufferPacker()
@@ -685,7 +704,9 @@ class LXMPeer(
                 println("[LXMPeer] Total transfer size for this sync is ${data.size} bytes")
                 val self = this
                 val resource = Resource.create(data, link!!, callback = { r -> self.resourceConcluded(r) })
-                currentlyTransferringMessages = wantedMessageIds.toList()
+                // Only IDs whose bytes are in this payload — completion
+                // bookkeeping keys off this list (see transferredIds above).
+                currentlyTransferringMessages = transferredIds.toList()
                 currentSyncTransferStarted = nowSeconds()
                 state = RESOURCE_TRANSFERRING
             } else {
