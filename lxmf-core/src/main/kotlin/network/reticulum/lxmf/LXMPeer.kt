@@ -67,6 +67,15 @@ class LXMPeer(
         const val MAX_UNREACHABLE = 14 * 24 * 60 * 60
 
         /**
+         * Consecutive sync rounds an entry may be omitted from the transfer
+         * payload (unreadable backing file) before it is dead-lettered.
+         * Bounded-retry hardening for the persistent sync strategy — without
+         * this, one permanently unreadable entry loops the peer forever
+         * (Greptile PR#38 r5). Python reference has no equivalent cap.
+         */
+        const val MAX_UNSENDABLE_ROUNDS = 5
+
+        /**
          * Every consecutive time a sync link fails to establish, add this
          * amount of time to wait before the next sync is attempted.
          */
@@ -262,6 +271,17 @@ class LXMPeer(
     var propagationStampCost: Int? = null
     var propagationStampCostFlexibility: Int? = null
     var currentlyTransferringMessages: List<ByteArray>? = null
+
+    /**
+     * Consecutive sync rounds in which an entry was wanted by the peer but
+     * omitted from the payload (backing file unreadable). Keyed by transient
+     * ID hex. After [MAX_UNSENDABLE_ROUNDS] consecutive omissions the entry
+     * is dead-lettered (marked handled with an error log) so the persistent
+     * strategy cannot loop forever — bounded-retry hardening, Greptile
+     * PR#38 r5.
+     */
+    val unsendableRoundCount = HashMap<String, Int>()
+
     val handledMessagesQueue = ArrayDeque<ByteArray>()
     val unhandledMessagesQueue = ArrayDeque<ByteArray>()
 
@@ -668,6 +688,7 @@ class LXMPeer(
 
                 val lxmList = mutableListOf<ByteArray>()
                 val transferredIds = mutableListOf<ByteArray>()
+                val omittedIds = mutableListOf<ByteArray>()
                 for (entryIndex in wantedMessages.indices) {
                     val messageEntry = wantedMessages[entryIndex]
                     val filePath = messageEntry.filePath ?: continue
@@ -682,7 +703,13 @@ class LXMPeer(
                         // (Greptile PR#38 re-review finding; python reference
                         // has the same divergence — hardened beyond upstream.)
                         transferredIds.add(wantedMessageIds[entryIndex])
+                    } else {
+                        omittedIds.add(wantedMessageIds[entryIndex])
                     }
+                }
+
+                if (omittedIds.isNotEmpty()) {
+                    println("[LXMPeer] ${omittedIds.size} of ${wantedMessages.size} wanted entries unreadable from the message store")
                 }
 
                 if (transferredIds.isEmpty()) {
@@ -707,6 +734,22 @@ class LXMPeer(
                 // Only IDs whose bytes are in this payload — completion
                 // bookkeeping keys off this list (see transferredIds above).
                 currentlyTransferringMessages = transferredIds.toList()
+                // Dead-letter tracking: entries omitted from the payload are
+                // counted per consecutive round; after MAX_UNSENDABLE_ROUNDS
+                // they are marked handled with a loud log (bounded retry —
+                // Greptile PR#38 r5). Prevents the persistent-strategy
+                // immediate re-sync from looping forever on permanently
+                // unreadable store files.
+                if (omittedIds.isNotEmpty()) {
+                    for (tid in omittedIds) {
+                        val hex = tid.toHexString()
+                        unsendableRoundCount[hex] = (unsendableRoundCount[hex] ?: 0) + 1
+                    }
+                    // Successful partial transfer resets nothing: counts only
+                    // decay via dead-lettering or manual store repair.
+                } else {
+                    unsendableRoundCount.clear()
+                }
                 currentSyncTransferStarted = nowSeconds()
                 state = RESOURCE_TRANSFERRING
             } else {
@@ -740,6 +783,34 @@ class LXMPeer(
             for (transientId in transferring) {
                 addHandledMessage(transientId)
                 removeUnhandledMessage(transientId)
+            }
+
+            // Dead-letter entries that have now been omitted for
+            // MAX_UNSENDABLE_ROUNDS consecutive rounds. Their bytes cannot be
+            // read, so they will never transfer; without this cap the
+            // persistent strategy would re-offer them forever (Greptile
+            // PR#38 r5). Loud log so operators can repair the store.
+            val deadLettered = mutableListOf<ByteArray>()
+            for ((hex, rounds) in unsendableRoundCount) {
+                if (rounds >= MAX_UNSENDABLE_ROUNDS) {
+                    val tid = hex.hexToBytesCompat()
+                    addHandledMessage(tid)
+                    removeUnhandledMessage(tid)
+                    deadLettered.add(tid)
+                }
+            }
+            if (deadLettered.isNotEmpty()) {
+                println(
+                    "[LXMPeer] DEAD-LETTER: ${deadLettered.size} entry(ies) omitted " +
+                        "from transfers for $MAX_UNSENDABLE_ROUNDS consecutive syncs; " +
+                        "marking handled to stop the retry loop. Store files are " +
+                        "missing/unreadable — inspect the message store for peer " +
+                        "${prettyHexRep(destinationHash)}: " +
+                        deadLettered.joinToString(", ") { prettyHexRep(it) }
+                )
+                for (tid in deadLettered) {
+                    unsendableRoundCount.remove(tid.toHexString())
+                }
             }
 
             link?.teardown()
