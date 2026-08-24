@@ -241,3 +241,26 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 **Description:** Kotlin msgpack values are typed at decode time; Python floats round-trip as msgpack floats while counters encode as ints. `fromBytes` decodes every numeric field through an int-or-float-tolerant helper so peers serialised by either implementation load correctly. Wire format itself is unchanged from Python (`to_bytes` field names/ordering identical).
 
 **Re-evaluation:** None needed.
+
+### Offer-response selection is bounded by the current offer (hardened beyond reference) — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMPeer.kt::offerResponse`
+
+**Python reference:** `LXMF/LXMPeer.py:448-452` (`offer_response`, WantedIds branch)
+
+**Category:** deliberate hardening (security fix, diverges from reference)
+
+**Date:** 2026-08-24
+
+**Description:** Python iterates the peer's reply IDs straight against the
+global `propagation_entries` store: duplicate IDs re-read and re-send the
+same message multiple times in one transfer, and an unoffered ID raises
+KeyError that aborts the entire sync. The Kotlin port originally mirrored
+the unbounded loop (null-safe lookup made it silently *worse*: ghosts were
+skipped while duplicates amplified). After PR#38 review flagged it as a P1,
+the Kotlin response processor now intersects reply IDs with `lastOffer`
+and deduplicates before store lookup — a malicious/buggy peer can no
+longer expand a sync transfer beyond its advertised bounds.
+
+**Re-evaluation:** Verified by difffuzz (unoffered/mixed/large scenarios:
+python aborts vs kt now bounds to offer; dup amplification eliminated).
+If markqvist fixes the upstream flaw, this deviation becomes parity.
+Consider reporting upstream separately.

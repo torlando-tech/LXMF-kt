@@ -1026,7 +1026,12 @@ private fun cmdFzPeer(params: JSONObject): JSONObject {
     // both directions accept cost-1 keys.
     router.peeringCost = cost
 
-    // addStaticPeer creates the entry if missing and never auto-culls it.
+    // Recreate the peering entry fresh each call so per-round counter
+    // reads are absolute (matches python fz_peer behavior, where a new
+    // LXMPeer replaces any existing entry).
+    if (router.getPeers().any { it.destinationHash.toHexString() == dhashHex }) {
+        router.unpeer(hexToBytes(dhashHex))
+    }
     router.addStaticPeer(dhashHex)
     val peer = router.getPeers().firstOrNull { it.destinationHash.toHexString() == dhashHex }
         ?: throw IllegalStateException("addStaticPeer did not produce a peering entry")

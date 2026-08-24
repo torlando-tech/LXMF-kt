@@ -617,7 +617,9 @@ class LXMPeer(
                             }
                         }
                     } else {
-                        // Peer wants all advertised messages
+                        // Peer wants all advertised messages. Bounds are the
+                        // offer itself, so no filtering needed here beyond the
+                        // store lookup (PR#38 P1 hardening note).
                         for (transientId in lastOffer) {
                             router.propagationEntriesMap[transientId.toHexString()]?.let {
                                 wantedMessages.add(it)
@@ -636,8 +638,21 @@ class LXMPeer(
                             removeUnhandledMessage(transientId)
                         }
                     }
+                    // Security hardening (PR#38 review P1): only accept IDs that
+                    // are (a) inside the CURRENT offer and (b) seen once. A peer
+                    // replying with duplicate or never-offered IDs must not be
+                    // able to expand the transfer beyond the advertised bounds.
+                    // This is deliberately STRICTER than the Python reference
+                    // (LXMPeer.py offer_response iterates response.ids against
+                    // the global store; unoffered IDs raise KeyError and abort
+                    // the sync, duplicates re-read files). Documented in
+                    // port-deviations.md as a hardened deviation.
+                    val wantedSeen = mutableSetOf<String>()
                     for (transientId in response.ids) {
-                        router.propagationEntriesMap[transientId.toHexString()]?.let {
+                        if (!containsId(lastOffer, transientId)) continue
+                        val hex = transientId.toHexString()
+                        if (!wantedSeen.add(hex)) continue
+                        router.propagationEntriesMap[hex]?.let {
                             wantedMessages.add(it)
                             wantedMessageIds.add(transientId)
                         }
