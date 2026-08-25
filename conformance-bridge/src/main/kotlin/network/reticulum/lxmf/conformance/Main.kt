@@ -12,8 +12,10 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXStamper
 import network.reticulum.lxmf.MessageState
 import network.reticulum.transport.Transport
 import org.json.JSONArray
@@ -782,6 +784,90 @@ private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
  * signature validation, so test bytes can use a dummy signature and
  * unknown destination/source hashes.
  */
+/**
+ * Peering-stamp generation (conformance suite lxmf-conformance#18).
+ *
+ * Byte-level command; no lxmf_init required. Mirrors
+ * lxmf_python.py::cmd_lxmf_generate_peering_stamp and drives the
+ * PRODUCTION path — LXStamper.generateStampWithWorkblock with the 25-round
+ * peering expansion (WORKBLOCK_EXPAND_ROUNDS_PEERING), exactly what
+ * LXMPeer.generatePeeringKey runs in the wild (python mirror:
+ * LXMPeer.py:259).
+ *
+ * Params:
+ *  - key_material_hex: raw key material (real handshake form on the
+ *    generating side: peer_hash + node_hash). Synthetic in tests.
+ *  - cost: target PoW cost (default LXMFConstants.PEERING_COST = 18).
+ *
+ * Returns: stamp_hex, value, cost.
+ */
+private fun cmdLxmfGeneratePeeringStamp(params: JSONObject): JSONObject {
+    val materialHex = params.optString("key_material_hex", "")
+    if (materialHex.isEmpty()) {
+        throw IllegalArgumentException("key_material_hex is required")
+    }
+    val cost = if (params.has("cost")) params.getInt("cost") else LXMFConstants.PEERING_COST
+
+    val keyMaterial = hexToBytes(materialHex)
+    val result = runBlocking {
+        LXStamper.generateStampWithWorkblock(
+            messageId = keyMaterial,
+            stampCost = cost,
+            expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
+        )
+    }
+    val stamp = result.stamp
+        ?: throw IllegalStateException("peering stamp generation failed at cost $cost")
+
+    return JSONObject()
+        .put("stamp_hex", stamp.toHexString())
+        .put("value", result.value)
+        .put("cost", cost)
+}
+
+/**
+ * Peering-stamp validation (conformance suite lxmf-conformance#18).
+ *
+ * Byte-level command; no lxmf_init required. Mirrors
+ * lxmf_python.py::cmd_lxmf_validate_peering_stamp and drives the
+ * PRODUCTION node-side check — LXStamper.validatePeeringKey, the same
+ * entry point LXMRouter's offer-request handler uses to authenticate an
+ * incoming sync offer (python mirror: LXMRouter.py ~2300-2307 via
+ * LXStamper.validate_peering_key).
+ *
+ * Params:
+ *  - peering_id_hex: validation id bytes (real node-side form:
+ *    node_hash + remote_hash). Synthetic in tests.
+ *  - stamp_hex: stamp to validate.
+ *  - cost: target PoW cost.
+ *
+ * Returns: valid (bool verdict), value (diagnostic), cost.
+ */
+private fun cmdLxmfValidatePeeringStamp(params: JSONObject): JSONObject {
+    val peeringIdHex = params.optString("peering_id_hex", "")
+    val stampHex = params.optString("stamp_hex", "")
+    if (peeringIdHex.isEmpty() || stampHex.isEmpty()) {
+        throw IllegalArgumentException("peering_id_hex and stamp_hex are required")
+    }
+    val cost = if (params.has("cost")) params.getInt("cost") else LXMFConstants.PEERING_COST
+
+    val peeringId = hexToBytes(peeringIdHex)
+    val stamp = hexToBytes(stampHex)
+    val valid = LXStamper.validatePeeringKey(peeringId, stamp, cost)
+
+    // Diagnostic value (not load-bearing for the verdict).
+    val workblock = LXStamper.generateWorkblock(
+        peeringId,
+        LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
+    )
+    val value = LXStamper.stampValue(workblock, stamp)
+
+    return JSONObject()
+        .put("valid", valid)
+        .put("value", value)
+        .put("cost", cost)
+}
+
 private fun cmdLxmfDecodeBytes(params: JSONObject): JSONObject {
     val DEST_LEN = 16
     val SIG_LEN = 64
@@ -1078,6 +1164,8 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_get_message_state" to ::cmdLxmfGetMessageState,
     "lxmf_get_message_progress" to ::cmdLxmfGetMessageProgress,
     "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
+    "lxmf_generate_peering_stamp" to ::cmdLxmfGeneratePeeringStamp,
+    "lxmf_validate_peering_stamp" to ::cmdLxmfValidatePeeringStamp,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
     // Differential-fuzz instrumentation (see comments above the handlers)
     "fz_seed_store" to ::cmdFzSeedStore,
