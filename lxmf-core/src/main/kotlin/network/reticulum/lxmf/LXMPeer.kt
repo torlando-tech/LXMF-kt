@@ -794,22 +794,11 @@ class LXMPeer(
                 // Only IDs whose bytes are in this payload — completion
                 // bookkeeping keys off this list (see transferredIds above).
                 currentlyTransferringMessages = transferredIds.toList()
-                // Dead-letter tracking: entries omitted from the payload are
-                // counted per consecutive round; after MAX_UNSENDABLE_ROUNDS
-                // they are marked handled with a loud log (bounded retry —
-                // Greptile PR#38 r5). Prevents the persistent-strategy
-                // immediate re-sync from looping forever on permanently
-                // unreadable store files.
-                if (omittedIds.isNotEmpty()) {
-                    for (tid in omittedIds) {
-                        val hex = tid.toHexString()
-                        unsendableRoundCount[hex] = (unsendableRoundCount[hex] ?: 0) + 1
-                    }
-                    // Successful partial transfer resets nothing: counts only
-                    // decay via dead-lettering or manual store repair.
-                } else {
-                    unsendableRoundCount.clear()
-                }
+                // Omission accounting already ran ABOVE (before the
+                // empty-transfer early return) and covers both this partial
+                // path and the all-unreadable path — do NOT increment again
+                // here or partial rounds would consume retries twice per
+                // round (Greptile PR#38 r7 P1).
                 currentSyncTransferStarted = nowSeconds()
                 state = RESOURCE_TRANSFERRING
             } else {
