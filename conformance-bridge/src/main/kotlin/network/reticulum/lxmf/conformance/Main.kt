@@ -12,8 +12,10 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.LXStamper
 import network.reticulum.lxmf.MessageState
 import network.reticulum.transport.Transport
 import org.json.JSONArray
@@ -782,6 +784,90 @@ private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
  * signature validation, so test bytes can use a dummy signature and
  * unknown destination/source hashes.
  */
+/**
+ * Peering-stamp generation (conformance suite lxmf-conformance#18).
+ *
+ * Byte-level command; no lxmf_init required. Mirrors
+ * lxmf_python.py::cmd_lxmf_generate_peering_stamp and drives the
+ * PRODUCTION path — LXStamper.generateStampWithWorkblock with the 25-round
+ * peering expansion (WORKBLOCK_EXPAND_ROUNDS_PEERING), exactly what
+ * LXMPeer.generatePeeringKey runs in the wild (python mirror:
+ * LXMPeer.py:259).
+ *
+ * Params:
+ *  - key_material_hex: raw key material (real handshake form on the
+ *    generating side: peer_hash + node_hash). Synthetic in tests.
+ *  - cost: target PoW cost (default LXMFConstants.PEERING_COST = 18).
+ *
+ * Returns: stamp_hex, value, cost.
+ */
+private fun cmdLxmfGeneratePeeringStamp(params: JSONObject): JSONObject {
+    val materialHex = params.optString("key_material_hex", "")
+    if (materialHex.isEmpty()) {
+        throw IllegalArgumentException("key_material_hex is required")
+    }
+    val cost = if (params.has("cost")) params.getInt("cost") else LXMFConstants.PEERING_COST
+
+    val keyMaterial = hexToBytes(materialHex)
+    val result = runBlocking {
+        LXStamper.generateStampWithWorkblock(
+            messageId = keyMaterial,
+            stampCost = cost,
+            expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
+        )
+    }
+    val stamp = result.stamp
+        ?: throw IllegalStateException("peering stamp generation failed at cost $cost")
+
+    return JSONObject()
+        .put("stamp_hex", stamp.toHexString())
+        .put("value", result.value)
+        .put("cost", cost)
+}
+
+/**
+ * Peering-stamp validation (conformance suite lxmf-conformance#18).
+ *
+ * Byte-level command; no lxmf_init required. Mirrors
+ * lxmf_python.py::cmd_lxmf_validate_peering_stamp and drives the
+ * PRODUCTION node-side check — LXStamper.validatePeeringKey, the same
+ * entry point LXMRouter's offer-request handler uses to authenticate an
+ * incoming sync offer (python mirror: LXMRouter.py ~2300-2307 via
+ * LXStamper.validate_peering_key).
+ *
+ * Params:
+ *  - peering_id_hex: validation id bytes (real node-side form:
+ *    node_hash + remote_hash). Synthetic in tests.
+ *  - stamp_hex: stamp to validate.
+ *  - cost: target PoW cost.
+ *
+ * Returns: valid (bool verdict), value (diagnostic), cost.
+ */
+private fun cmdLxmfValidatePeeringStamp(params: JSONObject): JSONObject {
+    val peeringIdHex = params.optString("peering_id_hex", "")
+    val stampHex = params.optString("stamp_hex", "")
+    if (peeringIdHex.isEmpty() || stampHex.isEmpty()) {
+        throw IllegalArgumentException("peering_id_hex and stamp_hex are required")
+    }
+    val cost = if (params.has("cost")) params.getInt("cost") else LXMFConstants.PEERING_COST
+
+    val peeringId = hexToBytes(peeringIdHex)
+    val stamp = hexToBytes(stampHex)
+    val valid = LXStamper.validatePeeringKey(peeringId, stamp, cost)
+
+    // Diagnostic value (not load-bearing for the verdict).
+    val workblock = LXStamper.generateWorkblock(
+        peeringId,
+        LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
+    )
+    val value = LXStamper.stampValue(workblock, stamp)
+
+    return JSONObject()
+        .put("valid", valid)
+        .put("value", value)
+        .put("cost", cost)
+}
+
 private fun cmdLxmfDecodeBytes(params: JSONObject): JSONObject {
     val DEST_LEN = 16
     val SIG_LEN = 64
@@ -896,6 +982,172 @@ private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
 // Dispatch
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Differential-fuzz instrumentation (fz_*) — passive victim-side hooks.
+//
+// Mirrors difffuzz/fuzz_bridge.py on the Python side. These commands are
+// INSTRUMENTATION ONLY: no adversarial payload crafting happens here.
+// The attacker role is always played by the Python fuzz bridge, which
+// wraps the reference /offer request handler. With these hooks either
+// implementation can serve as the victim whose OFFER RESPONSE processor
+// is under test (the surface where PR#38's Greptile P1 lives).
+// ----------------------------------------------------------------------
+
+private fun fzTruncatedHash(data: ByteArray): ByteArray =
+    java.security.MessageDigest.getInstance("SHA-256").digest(data).copyOfRange(0, 16)
+
+private fun cmdFzSeedStore(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_seed_store")
+
+    // enablePropagation() CLEARS and re-indexes the store, so it must run
+    // BEFORE seeding. Idempotent when already enabled.
+    if (!router.propagationNodeEnabled) router.enablePropagation()
+    val propDest = router.propagationDestination
+        ?: throw IllegalStateException("enablePropagation did not register a propagation destination")
+
+    val count = params.optInt("count", 4)
+    val size = params.optInt("size", 512)
+    val seed = params.optString("seed", "fuzz")
+    val unhandledFor = hexToBytes(params.getString("unhandled_for"))
+    if (unhandledFor.size != 16) {
+        throw IllegalArgumentException("unhandled_for must be a 16-byte propagation destination hash")
+    }
+
+    val storagePath = BridgeState.storagePath
+        ?: throw IllegalStateException("lxmf_init produced no storage path")
+    val msgDir = File(storagePath, "lxmf/messagestore").apply { mkdirs() }
+    val fillerDest = ByteArray(16)
+    val receivedSeconds = System.currentTimeMillis() / 1000L
+    val created = JSONArray()
+
+    for (i in 0 until count) {
+        val tid = fzTruncatedHash("$seed:$i".toByteArray(Charsets.UTF_8))
+        val data: ByteArray = fillerDest +
+            ByteArray(80) +
+            byteArrayOf(0xC3.toByte()) +
+            ByteArray(size) { 'B'.code.toByte() }
+        // Filename convention matches Python: <tid_hex>_<received_seconds>
+        val fpath = File(msgDir, "${tid.toHexString()}_$receivedSeconds")
+        fpath.writeBytes(data)
+
+        router.propagationEntriesMap[tid.toHexString()] = LXMRouter.PropagationEntry(
+            dstHash = fillerDest,
+            filePath = fpath.absolutePath,
+            receivedAt = receivedSeconds.toDouble(),
+            size = data.size,
+            stampValue = 0,
+            unhandledBy = mutableListOf(unhandledFor),
+        )
+        created.put(tid.toHexString())
+    }
+
+    return JSONObject()
+        .put("seeded", count)
+        .put("transient_ids", created)
+        .put("propagation_destination_hash", propDest.hash.toHexString())
+}
+
+private fun cmdFzDumpState(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_dump_state")
+
+    val entries = JSONObject()
+    for ((tidHex, e) in router.propagationEntriesMap) {
+        val handledBy = JSONArray()
+        for (p in e.handledBy) handledBy.put(p.toHexString())
+        val unhandledBy = JSONArray()
+        for (p in e.unhandledBy) unhandledBy.put(p.toHexString())
+        entries.put(
+            tidHex,
+            JSONObject()
+                .put("size", e.size)
+                .put("handled_peers", handledBy)
+                .put("unhandled_peers", unhandledBy)
+        )
+    }
+
+    val peersOut = JSONObject()
+    for (peer in router.getPeers()) {
+        val transferring = JSONArray()
+        peer.currentlyTransferringMessages?.forEach { transferring.put(it.toHexString()) }
+        peersOut.put(
+            peer.destinationHash.toHexString(),
+            JSONObject()
+                .put("state", peer.state)
+                .put("offered", peer.offered)
+                .put("outgoing", peer.outgoing)
+                .put("incoming", peer.incoming)
+                .put("currently_transferring", transferring)
+        )
+    }
+
+    val sinceSeq = params.optInt("since_seq", 0)
+    val messages = JSONArray()
+    var lastSeq: Int
+    BridgeState.inboxLock.withLock {
+        for (m in BridgeState.inbox) {
+            if (m.getInt("seq") > sinceSeq) messages.put(m)
+        }
+        lastSeq = BridgeState.inboxSeq
+        Unit
+    }
+
+    return JSONObject()
+        .put(
+            "propagation_destination_hash",
+            router.propagationDestination?.hash?.toHexString() ?: ""
+        )
+        .put("entry_count", router.propagationEntriesMap.size)
+        .put("entries", entries)
+        .put("peers", peersOut)
+        .put("inbox", JSONObject().put("messages", messages).put("last_seq", lastSeq))
+}
+
+private fun cmdFzPeer(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_peer")
+    val dhashHex = params.getString("destination_hash")
+    val cost = params.optInt("peering_cost", 1)
+
+    // Router-level cost governs inbound key validation; per-peer cost
+    // governs outbound key minting. Both pinned so PoW is instant and
+    // both directions accept cost-1 keys.
+    router.peeringCost = cost
+
+    // Recreate the peering entry fresh each call so per-round counter
+    // reads are absolute (matches python fz_peer behavior, where a new
+    // LXMPeer replaces any existing entry).
+    if (router.getPeers().any { it.destinationHash.toHexString() == dhashHex }) {
+        router.unpeer(hexToBytes(dhashHex))
+    }
+    router.addStaticPeer(dhashHex)
+    val peer = router.getPeers().firstOrNull { it.destinationHash.toHexString() == dhashHex }
+        ?: throw IllegalStateException("addStaticPeer did not produce a peering entry")
+    peer.peeringCost = cost
+    // Pin the outbound stamp-cost knowledge too — sync() postpones while
+    // propagationStampCost/Flexibility are null (mirrors Python).
+    peer.propagationStampCost = 1
+    peer.propagationStampCostFlexibility = 1
+
+    return JSONObject().put("ok", true).put("peered", dhashHex).put("peering_cost", cost)
+}
+
+private fun cmdFzSetPeeringCost(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_set_peering_cost")
+    val cost = params.getInt("cost")
+    router.peeringCost = cost
+    for (peer in router.getPeers()) peer.peeringCost = cost
+    return JSONObject().put("peering_cost", cost)
+}
+
+private fun cmdFzSyncPeers(params: JSONObject): JSONObject {
+    val router = ensureRouter("fz_sync_peers")
+    var n = 0
+    for (peer in router.getPeers()) {
+        peer.sync()
+        n++
+    }
+    return JSONObject().put("triggered", true).put("peers", n)
+}
+
 private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_init" to ::cmdLxmfInit,
     "lxmf_add_tcp_server_interface" to ::cmdLxmfAddTcpServerInterface,
@@ -912,7 +1164,15 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_get_message_state" to ::cmdLxmfGetMessageState,
     "lxmf_get_message_progress" to ::cmdLxmfGetMessageProgress,
     "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
+    "lxmf_generate_peering_stamp" to ::cmdLxmfGeneratePeeringStamp,
+    "lxmf_validate_peering_stamp" to ::cmdLxmfValidatePeeringStamp,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
+    // Differential-fuzz instrumentation (see comments above the handlers)
+    "fz_seed_store" to ::cmdFzSeedStore,
+    "fz_dump_state" to ::cmdFzDumpState,
+    "fz_peer" to ::cmdFzPeer,
+    "fz_set_peering_cost" to ::cmdFzSetPeeringCost,
+    "fz_sync_peers" to ::cmdFzSyncPeers,
 )
 
 private fun handleRequest(line: String): JSONObject {
