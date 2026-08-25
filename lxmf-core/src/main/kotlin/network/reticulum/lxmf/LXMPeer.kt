@@ -731,8 +731,20 @@ class LXMPeer(
                     // retry accounting forever (Greptile PR#38 r6 P1).
                     val filePath = messageEntry.filePath
                     val file = filePath?.let { java.io.File(it) }
-                    if (file != null && file.isFile) {
-                        lxmList.add(file.readBytes())
+                    // Per-entry read guard: a file that passes isFile() but
+                    // throws mid-read (permissions changed, IO error, race
+                    // with store cleanup) must count as OMITTED, not escape
+                    // to the generic catch below — there it would skip all
+                    // omission accounting and loop the sync forever, the
+                    // same defect class as r6 through a third door.
+                    val bytes: ByteArray? = try {
+                        file?.takeIf { it.isFile }?.readBytes()
+                    } catch (e: Exception) {
+                        println("[LXMPeer] Failed reading store file for ${prettyHexRep(wantedMessageIds[entryIndex])}: $e")
+                        null
+                    }
+                    if (bytes != null) {
+                        lxmList.add(bytes)
                         // Track only entries whose bytes actually made it into
                         // the payload. Completion bookkeeping (handled/unhandled
                         // flips, counters) must never include an entry that was
