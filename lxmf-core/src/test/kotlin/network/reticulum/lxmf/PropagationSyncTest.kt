@@ -73,11 +73,100 @@ class PropagationSyncTest {
         val state = router.propagationTransferState
         println("State after sync: $state")
 
-        // Should NOT be FAILED (should be LINK_ESTABLISHING)
+        // Should NOT be FAILED. With the path-request preflight in place, the
+        // transient state here is PATH_REQUESTED (no real interfaces in the
+        // test, so Transport has no path); previously it was LINK_ESTABLISHING.
         assertNotEquals(
             LXMRouter.PropagationTransferState.FAILED,
             state,
             "Sync should not fail when node is in map and hash is set",
+        )
+
+        router.close()
+    }
+
+    @Test
+    fun `requestMessages enters PATH_REQUESTED when no path is known`() {
+        // Mirror python LXMF/LXMRouter.py:514-520: when Transport has no path
+        // to the active propagation node, the request must transition into
+        // PR_PATH_REQUESTED so the path-wait job can resolve before linking.
+        val router = LXMRouter(identity = identity)
+        val nodeIdentity = Identity.create()
+        val nodeDestHash =
+            network.reticulum.destination.Destination.hash(
+                nodeIdentity,
+                "lxmf",
+                "propagation",
+            )
+        val nodeHexHash = nodeDestHash.joinToString("") { "%02x".format(it) }
+
+        router.setActivePropagationNode(nodeHexHash)
+        router.addPropagationNode(
+            LXMRouter.PropagationNode(
+                destHash = nodeDestHash,
+                identity = nodeIdentity,
+                isActive = true,
+            ),
+        )
+        router.start()
+
+        // Test precondition: with enableTransport=false there are no interfaces,
+        // so Transport cannot have a path to a freshly-generated identity.
+        check(!Transport.hasPath(nodeDestHash)) { "Transport unexpectedly knew a path" }
+
+        router.requestMessagesFromPropagationNode()
+
+        assertEquals(
+            LXMRouter.PropagationTransferState.PATH_REQUESTED,
+            router.propagationTransferState,
+            "Should enter PATH_REQUESTED when no path is known",
+        )
+
+        router.close()
+    }
+
+    @Test
+    fun `duplicate requestMessages during PATH_REQUESTED is a no-op`() {
+        // Concurrent callers (manual sync racing the periodic timer, etc.)
+        // must not spawn a second path-wait job. The first call sets state
+        // to PATH_REQUESTED; the second call must early-return so we don't
+        // race two `requestMessagesPathJob` coroutines that both retry when
+        // the path arrives.
+        val router = LXMRouter(identity = identity)
+        val nodeIdentity = Identity.create()
+        val nodeDestHash =
+            network.reticulum.destination.Destination.hash(
+                nodeIdentity,
+                "lxmf",
+                "propagation",
+            )
+        val nodeHexHash = nodeDestHash.joinToString("") { "%02x".format(it) }
+
+        router.setActivePropagationNode(nodeHexHash)
+        router.addPropagationNode(
+            LXMRouter.PropagationNode(
+                destHash = nodeDestHash,
+                identity = nodeIdentity,
+                isActive = true,
+            ),
+        )
+        router.start()
+        check(!Transport.hasPath(nodeDestHash)) { "Transport unexpectedly knew a path" }
+
+        router.requestMessagesFromPropagationNode()
+        assertEquals(
+            LXMRouter.PropagationTransferState.PATH_REQUESTED,
+            router.propagationTransferState,
+            "First call should enter PATH_REQUESTED",
+        )
+
+        // Second call while the wait is in progress — must not advance state
+        // or change the path-wait deadline.
+        router.requestMessagesFromPropagationNode()
+        assertEquals(
+            LXMRouter.PropagationTransferState.PATH_REQUESTED,
+            router.propagationTransferState,
+            "Duplicate call must not transition out of PATH_REQUESTED",
         )
 
         router.close()
