@@ -348,6 +348,25 @@ object LXMFConstants {
 
     /** Request path for offering messages to peers */
     const val OFFER_REQUEST_PATH = "/offer"
+
+    // ===== PAPER / QR Constants (LXMessage.py:102-106) =====
+
+    /** Feature flag signalling compression support in announce app data (LXMF.py:142) */
+    const val SF_COMPRESSION = 0x00
+
+    /** QR error correction level descriptor (informational; see LXMessage.asQr) */
+    const val QR_ERROR_CORRECTION = "ERROR_CORRECT_L"
+
+    /** Maximum bytes a QR code of version 40 with ERROR_CORRECT_L can store */
+    const val QR_MAX_STORAGE = 2953
+
+    /**
+     * Maximum packed LXM size that survives QR encoding:
+     * base64url expands 8 bytes to 6 chars... inverted: each 6-bit group is one
+     * QR character, so usable bytes = ((QR_MAX_STORAGE - len("lxm://")) * 6) / 8.
+     * With defaults: ((2953 - 5) * 6) // 8 = 2211 bytes.
+     */
+    const val PAPER_MDU = ((QR_MAX_STORAGE - URI_SCHEMA.length - 3) * 6) / 8
 }
 
 /**

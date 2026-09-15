@@ -1,0 +1,132 @@
+Subject: LXMF peer-sync correctness: three reproducible flaws in LXMPeer.offer_response / resource_concluded
+
+Hi Mark,
+
+I'm one of the people building on LXMF outside Python — we maintain a Kotlin
+port (LXMF-kt, https://github.com/libre-7/LXMF-kt) and run a wire-level
+differential fuzzer against your reference implementation. The fuzzer surfaced
+three related flaws in the propagation-peer sync path, all reproduced against a
+pristine checkout of master (795fdaa). Since GitHub issues are disabled on the
+LXMF repo and you ask that well-founded reports reach you directly, this is
+that report.
+
+Scope first: triggering any of these requires an authenticated, accepted
+peering (valid PoW peering key + known identity), so this is about resilience
+against a malicious or buggy *peer*, not something an unauthenticated node can
+do remotely. It matters for lxmd operators and anything relying on peer sync.
+
+All three reproduce with the attached script (also inline-linkable:
+https://github.com/libre-7/LXMF-kt/blob/feat/full-parity/difffuzz/verify_upstream_flaws.py).
+It builds a real LXMRouter with propagation enabled, seeds four deterministic
+store entries, constructs a real LXMPeer, and calls offer_response() /
+resource_concluded() directly — only RNS.Resource is stubbed to capture the
+payload. Runs offline in ~5 seconds against a stock checkout. Line references
+are against current master; LXMF/LXMPeer.py.
+
+
+--- FLAW 1: reply IDs are not bounded by the offer; duplicates amplify ---
+
+offer_response(), WantedIds branch (lines 450-452):
+
+    for transient_id in response:
+        wanted_messages.append(self.router.propagation_entries[transient_id])
+        wanted_message_ids.append(transient_id)
+
+Reply IDs are looked up in the global propagation_entries store with no
+intersection against self.last_offer and no dedup. Consequences:
+
+  * Duplicate IDs: the same message is re-read from disk and appended to the
+    transfer payload once per occurrence.
+  * Unoffered IDs: entries outside the advertised offer are disclosed and
+    transferred.
+
+Repro output (4-entry store, reply = [A,A,A,B,C,D], one ID tripled):
+
+    reply contained      : 6 IDs (4 distinct)
+    payload carries      : 6 messages
+    transfer index holds : 6 IDs
+    => AMPLIFIED x1.5: 4 distinct messages wire-sent 6 times
+
+Amplification is attacker-chosen: N repetitions of an ID means N disk reads
+and N wire copies per sync round.
+
+Fix direction: intersect `response` with `self.last_offer` and dedupe before
+the lookup loop.
+
+
+--- FLAW 2: KeyError abort marks offered messages handled anyway (self-DoS) ---
+
+Same branch: the "not-wanted => mark handled" loop (443-448) runs BEFORE the
+wanted loop (450-452). If the reply contains any ID absent from the store,
+line 451 raises KeyError and the blanket handler (480-486) swallows it — but
+by then every legitimately offered entry has already been marked handled:
+
+    before: 4 unhandled entries offered
+    reply wanted <real-id> + ghost <never-offered-id>
+    handler hit KeyError internally -> sync aborted, nothing transferred
+    after abort      : 3/4 offered entries marked HANDLED
+
+Net effect: ONE malicious or buggy reply permanently desynchronizes the victim
+from that peer. Nothing was transferred, but those messages will never be
+re-offered to it again. The victim's own store still holds them; only this
+peering relationship is poisoned, silently. Recovery requires manual
+intervention (unpeer/re-peer or wiping peer state).
+
+This compounds with Flaw 1's fix direction above — intersecting with
+last_offer eliminates both the amplification and the abort path entirely.
+
+
+--- FLAW 3: unsent message recorded as delivered when backing file is missing ---
+
+Payload build (458-464) skips entries whose file can't be read:
+
+    for message_entry in wanted_messages:
+        file_path = message_entry[1]
+        if os.path.isfile(file_path):
+            ...lxm_list.append(lxmf_data)
+
+...but wanted_message_ids keeps the full list, and resource_concluded()
+(500-502) marks every ID in the index handled on completion:
+
+    for transient_id in self.currently_transferring_messages:
+        self.add_handled_message(transient_id)
+        self.remove_unhandled_message(transient_id)
+
+Repro (one store file deleted between seeding and sync):
+
+    payload carries     : 3 messages (3 readable files)
+    transfer index holds: 4 IDs (includes deleted-file entry)
+    after completion    : 4/4 marked handled; deleted-file entry marked handled: True
+    => message whose bytes NEVER LEFT the node is recorded as delivered
+
+Related second-order behavior: under STRATEGY_PERSISTENT, completion
+immediately re-syncs while unhandled messages remain (523-524), so a
+permanently unreadable entry now cycles forever (link establish -> offer ->
+partial transfer -> complete -> re-sync) with no retry cap. Bounded by link
+RTT so it's slow, but unbounded.
+
+Fix direction: build the transfer index from exactly the entries whose bytes
+entered the payload (append the ID at the same place the data is appended), so
+completion bookkeeping matches what was actually sent. For the retry cycle, a
+retry cap or dead-letter marking after K attempts would bound it.
+
+
+--- Context and prior art ---
+
+We found these via differential fuzzing while preparing our port's parity PR;
+the Kotlin implementation now bounds selection by the current offer + dedupes
+(Flaws 1/2) and keys completion bookkeeping off actually-transferred entries
+(Flaw 3). Those changes and the fuzzer itself are in
+https://github.com/torlando-tech/LXMF-kt/pull/38 (difffuzz/ directory) — happy
+to upstream any of it, or send the fuzzer as a standalone patch against the
+Python test suite if that's more useful.
+
+No embargo needed on our side — these are peer-authenticated robustness issues
+and we haven't published details anywhere else yet. Happy to provide more
+repro detail or test specific proposed fixes against the fuzz rig.
+
+Thanks for LXMF and Reticulum — the codebase made both the port and the
+fuzzing work straightforward.
+
+Best regards,
+<YOUR NAME>

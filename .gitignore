@@ -33,3 +33,5 @@ local.properties
 .claude/
 .claude-flow/
 .mcp.json
+__pycache__/
+*.pyc
