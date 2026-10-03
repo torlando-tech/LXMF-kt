@@ -58,6 +58,9 @@ class LXMRouter(
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
 
+        /** Upper bound on waiting for an opportunistic proof before resending, in milliseconds */
+        const val MAX_OPPORTUNISTIC_PROOF_WAIT = 60_000L
+
         /**
          * Propagation-node path-request timeout, in milliseconds.
          *
@@ -628,6 +631,17 @@ class LXMRouter(
                             // For propagated messages, SENT is final
                             if (message.method == DeliveryMethod.PROPAGATED) {
                                 toRemove.add(message)
+                            } else if (message.method == DeliveryMethod.OPPORTUNISTIC) {
+                                // An opportunistic packet has no delivery guarantee: keep
+                                // resending until its proof arrives (DELIVERED) or the
+                                // attempts run out. Python only takes DELIVERED messages
+                                // out of the queue, so SENT ones go through the retry
+                                // logic again. Without this, a packet lost on air (or
+                                // sent before a path was known) stayed SENT forever.
+                                val nextAttempt = message.nextDeliveryAttempt ?: 0L
+                                if (currentTime >= nextAttempt) {
+                                    toDispatch.add(message)
+                                }
                             }
                         }
 
@@ -773,6 +787,7 @@ class LXMRouter(
             message.deliveryAttempts >= MAX_PATHLESS_TRIES && !hasPath -> {
                 println("[LXMRouter] Requesting path after ${message.deliveryAttempts} pathless tries for ${message.destinationHash.toHexString()}")
                 message.deliveryAttempts++
+                message.opportunisticPathRequested = true
                 Transport.requestPath(dest.hash)
                 message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
                 message.progress = 0.01
@@ -780,7 +795,12 @@ class LXMRouter(
 
             // At MAX_PATHLESS_TRIES+1 with path but still failing, rediscover path
             // Python: elif delivery_attempts == MAX_PATHLESS_TRIES+1 and has_path()
-            message.deliveryAttempts == MAX_PATHLESS_TRIES + 1 && hasPath -> {
+            // Deviation: Python also lands here right after its own path request
+            // was answered, and drops that fresh path. On slow links (LoRa,
+            // Meshtastic) that costs another PATH_REQUEST_WAIT plus a round trip,
+            // so a path we just requested is used for a send attempt first.
+            message.deliveryAttempts == MAX_PATHLESS_TRIES + 1 && hasPath &&
+                !message.opportunisticPathRequested -> {
                 println("[LXMRouter] Opportunistic delivery still unsuccessful after ${message.deliveryAttempts} attempts, trying to rediscover path")
                 message.deliveryAttempts++
                 // Drop existing path and re-request (Python does this via Reticulum.drop_path + request_path)
@@ -864,16 +884,27 @@ class LXMRouter(
         if (receipt != null) {
             println("[LXMRouter] Sent opportunistic message to ${message.destinationHash.toHexString()}")
 
-            // Set up delivery confirmation callback
+            // Set up delivery confirmation callback. A proof for any of the
+            // copies sent by earlier attempts also counts.
             receipt.setDeliveryCallback { _ ->
-                message.state = MessageState.DELIVERED
-                message.deliveryCallback?.invoke(message)
+                if (message.state != MessageState.DELIVERED) {
+                    message.state = MessageState.DELIVERED
+                    message.deliveryCallback?.invoke(message)
+                }
             }
 
-            // Set up timeout callback
-            receipt.setTimeoutCallback { _ ->
-                message.state = MessageState.FAILED
-                message.failedCallback?.invoke(message)
+            // No timeout callback: like Python, a missing proof is handled by
+            // the retry loop in processOpportunisticDelivery, which fails the
+            // message only after MAX_DELIVERY_ATTEMPTS.
+
+            // Deviation: Python resends after a flat DELIVERY_RETRY_WAIT. On slow
+            // links the proof can take longer than that (Meshtastic: 6-14 s), and
+            // an early resend costs airtime for a duplicate. With a known path,
+            // wait at least as long as the receipt expects the proof to take.
+            if (Transport.hasPath(dest.hash)) {
+                val proofWait = (receipt.timeout * 1000).toLong().coerceAtMost(MAX_OPPORTUNISTIC_PROOF_WAIT)
+                message.nextDeliveryAttempt =
+                    maxOf(message.nextDeliveryAttempt ?: 0L, System.currentTimeMillis() + proofWait)
             }
 
             return true
