@@ -184,6 +184,14 @@ class LXMessage private constructor(
      */
     var pathRequestRetried: Boolean = false
 
+    /**
+     * Whether opportunistic delivery requested a path because none was known.
+     * Transient delivery-state — NOT part of the packed wire format. When that
+     * request is answered, the fresh path is used instead of being dropped and
+     * re-requested (see LXMRouter.processOpportunisticDelivery).
+     */
+    var opportunisticPathRequested: Boolean = false
+
     // ===== Receive-time Packet Metadata =====
     //
     // The following fields are populated from the delivering Reticulum packet

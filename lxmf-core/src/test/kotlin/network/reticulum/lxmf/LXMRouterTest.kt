@@ -485,6 +485,98 @@ class LXMRouterTest {
         )
     }
 
+    private fun opportunisticMessage(): LXMessage {
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        val destDestination = Destination.create(
+            identity = Identity.create(),
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+        return LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test",
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC
+        )
+    }
+
+    /** Puts [message] in the state a sent-but-unproven opportunistic packet is left in. */
+    private suspend fun queueAsSentOpportunistic(message: LXMessage, attempts: Int) {
+        router.handleOutbound(message)
+        // handleOutbound launches its own processOutbound; let it settle before
+        // overriding the state it may have touched.
+        router.processOutbound()
+        message.state = MessageState.SENT
+        message.method = DeliveryMethod.OPPORTUNISTIC
+        message.deliveryAttempts = attempts
+        message.nextDeliveryAttempt = 0L
+    }
+
+    @Test
+    fun `sent opportunistic message without proof is retried`() = runBlocking {
+        // Regression: processOutbound only handled SENT for PROPAGATED, so an
+        // opportunistic packet that was lost (or sent before a path was known)
+        // sat in SENT forever with no further attempt.
+        val message = opportunisticMessage()
+        queueAsSentOpportunistic(message, attempts = 1)
+
+        withTimeout(5_000) {
+            while (message.deliveryAttempts == 1) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
+
+        assertTrue(message.deliveryAttempts > 1, "a SENT opportunistic message must get another attempt")
+        assertEquals(1, router.pendingOutboundCount(), "an unproven message stays queued")
+    }
+
+    @Test
+    fun `sent opportunistic message fails after max attempts`() = runBlocking {
+        val message = opportunisticMessage()
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        message.failedCallback = { callbackFired.set(true) }
+        queueAsSentOpportunistic(message, attempts = LXMRouter.MAX_DELIVERY_ATTEMPTS + 1)
+
+        withTimeout(5_000) {
+            while (message.state != MessageState.FAILED) {
+                message.nextDeliveryAttempt = 0L
+                delay(50)
+                router.processOutbound()
+            }
+        }
+
+        assertEquals(MessageState.FAILED, message.state)
+        assertTrue(callbackFired.get(), "failedCallback lets the app fall back to propagation")
+    }
+
+    @Test
+    fun `pathless opportunistic retry requests a path and remembers it`() = runBlocking {
+        // The destination is unknown to Transport, so the next attempt must
+        // request a path. The flag keeps the answer to that request from being
+        // dropped as a stale path one attempt later.
+        val message = opportunisticMessage()
+        queueAsSentOpportunistic(message, attempts = LXMRouter.MAX_PATHLESS_TRIES)
+
+        withTimeout(5_000) {
+            while (!message.opportunisticPathRequested) {
+                delay(50)
+                router.processOutbound()
+            }
+        }
+
+        assertEquals(LXMRouter.MAX_PATHLESS_TRIES + 1, message.deliveryAttempts)
+    }
+
     // ===== Propagation Node Tests =====
 
     @Test
