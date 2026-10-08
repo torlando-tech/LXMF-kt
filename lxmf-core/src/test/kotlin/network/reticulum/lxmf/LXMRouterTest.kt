@@ -1321,42 +1321,49 @@ class LXMRouterTest {
         // decide on _enforceStamps alone.
         router.setInboundStampCost(dest.hexHash, 4)
 
-        // Assemble raw LXMF wire bytes: dest(16) + source(16) +
+        // Assemble raw unstamped LXMF wire bytes: dest(16) + source(16) +
         // signature(64) + payload. Payload is a 4-element msgpack array
         // (double ts, bin title, bin content, empty-map fields) with NO
-        // stamp element, matching the conformance bridge command.
+        // stamp element, matching the conformance bridge command. Each
+        // call uses a fresh random source hash so the message hash is
+        // unique and the dedup path (locallyDeliveredTransientIds) can
+        // never swallow it - that way the assertion below genuinely
+        // reaches the stamp gate rather than short-circuiting on dedup.
         val destHash = dest.hash
-        val sourceHash = ByteArray(16).apply { java.security.SecureRandom().nextBytes(this) }
-        val signature = ByteArray(64)
-        val packed = java.io.ByteArrayOutputStream()
-        val packer = org.msgpack.core.MessagePack.newDefaultPacker(packed)
-        packer.packArrayHeader(4)
-        packer.packDouble(System.currentTimeMillis() / 1000.0)
-        packer.packBinaryHeader("stamp-gate".toByteArray(Charsets.UTF_8).size)
-        packer.writePayload("stamp-gate".toByteArray(Charsets.UTF_8))
-        packer.packBinaryHeader("content".toByteArray(Charsets.UTF_8).size)
-        packer.writePayload("content".toByteArray(Charsets.UTF_8))
-        packer.packMapHeader(0)
-        packer.close()
-        val lxmfBytes = destHash + sourceHash + signature + packed.toByteArray()
+        val makeUnstampedBytes = {
+            val sourceHash = ByteArray(16).apply { java.security.SecureRandom().nextBytes(this) }
+            val signature = ByteArray(64)
+            val packed = java.io.ByteArrayOutputStream()
+            val packer = org.msgpack.core.MessagePack.newDefaultPacker(packed)
+            packer.packArrayHeader(4)
+            packer.packDouble(System.currentTimeMillis() / 1000.0)
+            packer.packBinaryHeader("stamp-gate".toByteArray(Charsets.UTF_8).size)
+            packer.writePayload("stamp-gate".toByteArray(Charsets.UTF_8))
+            packer.packBinaryHeader("content".toByteArray(Charsets.UTF_8).size)
+            packer.writePayload("content".toByteArray(Charsets.UTF_8))
+            packer.packMapHeader(0)
+            packer.close()
+            destHash + sourceHash + signature + packed.toByteArray()
+        }
 
-        // Default: stamp enforcement disabled -> unstamped message is
+        // Default: stamp enforcement disabled -> an unstamped message is
         // allowed through (returns true).
         assertTrue(
-            router.lxmfDelivery(lxmfBytes),
+            router.lxmfDelivery(makeUnstampedBytes()),
             "With stamp enforcement disabled (the Python-default parity), an " +
                 "unstamped message addressed to a stamp-cost destination must " +
                 "be delivered, not dropped.",
         )
 
-        // Once enforcement is enabled, the same unstamped message must be
-        // dropped (returns false).
+        // Once enforcement is enabled, a FRESH unstamped message must be
+        // dropped at the stamp gate (returns false).
         router.enforceStamps()
         assertTrue(router.isEnforcingStamps())
         assertFalse(
-            router.lxmfDelivery(lxmfBytes),
+            router.lxmfDelivery(makeUnstampedBytes()),
             "Once enforceStamps() is called, an unstamped message must be " +
-                "dropped (returns false), matching Python enforce_stamps().",
+                "dropped at the stamp gate (returns false), matching Python " +
+                "enforce_stamps().",
         )
     }
 }
