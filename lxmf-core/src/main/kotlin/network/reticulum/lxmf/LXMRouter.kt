@@ -3081,7 +3081,14 @@ class LXMRouter(
         val path = storagePath ?: return
         val file = File(path, "lxmf/available_tickets")
         if (!file.exists()) return
+        // Serialize the map replacement with saveAvailableTickets (which holds
+        // ticketFileMutex) so a background save cannot read a map's size and
+        // then walk it while a reload clears/refills it mid-write, which would
+        // persist a truncated header.
+        runBlocking { ticketFileMutex.withLock { loadAvailableTicketsLocked(file) } }
+    }
 
+    private fun loadAvailableTicketsLocked(file: File) {
         try {
             val data = file.readBytes()
             val unpacker = MessagePack.newDefaultUnpacker(data)
