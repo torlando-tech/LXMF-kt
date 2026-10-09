@@ -15,6 +15,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -140,7 +141,7 @@ class LXMRouterClientSurfaceTest {
     }
 
     @Test
-    fun `getOutboundLxmStampCost null for unknown message`() {
+    fun `getOutboundLxmStampCost null for unknown message`() = runBlocking {
         assertNull(router.getOutboundLxmStampCost("deadbeef"))
         assertNull(router.getOutboundLxmPropagationStampCost("deadbeef"))
     }
@@ -257,11 +258,17 @@ class LXMRouterClientSurfaceTest {
     }
 
     @Test
-    fun `registerExitHandler can be added and removed`() {
-        // Registers a shutdown hook; JVM allows counting them to verify registration
-        val hooksBefore = Thread.getAllStackTraces().keys.size
+    fun `registerExitHandler adds one hook and close removes it`() {
+        assertNull(router.exitHook)
         router.registerExitHandler()
-        // No exception means the hook was accepted; sanity check on thread count is informational
-        assertTrue(Thread.getAllStackTraces().keys.size >= hooksBefore)
+        val hook = router.exitHook
+        assertNotNull(hook, "registerExitHandler must store the hook")
+        // Idempotent: a second call must not replace or duplicate it.
+        router.registerExitHandler()
+        assertSame(hook, router.exitHook)
+        // close() unregisters the hook so the router (and its captured
+        // references) can be garbage-collected after close+recreate.
+        router.close()
+        assertNull(router.exitHook)
     }
 }

@@ -1993,6 +1993,10 @@ class LXMRouter(
         processingJob?.cancel()
     }
 
+    /** In-flight shutdown hook (one per router); removed on close(). */
+    @Volatile
+    internal var exitHook: Thread? = null
+
     /**
      * Release the router's [processingScope] and the periodic processing
      * loop. Intended for non-singleton use — tests that create many routers,
@@ -2007,6 +2011,8 @@ class LXMRouter(
     override fun close() {
         stop()
         processingScope.cancel()
+        exitHook?.let { runCatching { Runtime.getRuntime().removeShutdownHook(it) } }
+        exitHook = null
     }
 
     // ===== Utility Methods =====
@@ -2728,7 +2734,11 @@ class LXMRouter(
 
             // Send third request to acknowledge/delete received messages on the node
             // Matches Python LXMRouter.py:1566-1572
-            if (receivedHashes.isNotEmpty()) {
+            // Gate on retainSyncedOnNode: when the caller wants to keep
+            // downloaded messages on the node, skip the delete request
+            // (Python message_list_response line 1590: haves list is empty
+            // when retain_synced_on_node is True, so the node keeps them).
+            if (receivedHashes.isNotEmpty() && !retainSyncedOnNode) {
                 try {
                     link.request(
                         path = LXMFConstants.MESSAGE_GET_PATH,
@@ -3076,6 +3086,14 @@ class LXMRouter(
             val data = file.readBytes()
             val unpacker = MessagePack.newDefaultUnpacker(data)
             val mapSize = unpacker.unpackMapHeader()
+
+            // Replace, not merge: clear the in-memory maps first so tickets
+            // removed from the file (or an empty section) no longer count as
+            // available. Matches Python reload_available_tickets, which does
+            // self.available_tickets = msgpack.unpackb(data) (full replace).
+            outboundTickets.clear()
+            inboundTickets.clear()
+            lastTicketDeliveries.clear()
 
             for (i in 0 until mapSize) {
                 val key = unpacker.unpackString()
@@ -3434,14 +3452,15 @@ class LXMRouter(
      * Returns null when an outbound ticket bypasses the stamp.
      * Matches Python `get_outbound_lxm_stamp_cost()`.
      */
-    fun getOutboundLxmStampCost(lxmHashHex: String): Int? {
-        pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
-            return if (message.outboundTicket != null) null else message.stampCost
+    suspend fun getOutboundLxmStampCost(lxmHashHex: String): Int? {
+        return pendingOutboundMutex.withLock {
+            pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
+                if (message.outboundTicket != null) null else message.stampCost
+            }
+                ?: pendingDeferredStamps.values.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
+                    if (message.outboundTicket != null) null else message.stampCost
+                }
         }
-        pendingDeferredStamps.values.firstOrNull { it.hash?.toHexString() == lxmHashHex }?.let { message ->
-            return if (message.outboundTicket != null) null else message.stampCost
-        }
-        return null
     }
 
     /**
@@ -3450,10 +3469,12 @@ class LXMRouter(
      * LXMessage does not track `propagation_target_cost`; the effective target
      * is derived from the active node via [getOutboundPropagationCost].
      */
-    fun getOutboundLxmPropagationStampCost(lxmHashHex: String): Int? {
+    suspend fun getOutboundLxmPropagationStampCost(lxmHashHex: String): Int? {
         val pending =
-            pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex } != null ||
-                pendingDeferredStamps.values.any { it.hash?.toHexString() == lxmHashHex }
+            pendingOutboundMutex.withLock {
+                pendingOutbound.firstOrNull { it.hash?.toHexString() == lxmHashHex } != null ||
+                    pendingDeferredStamps.values.any { it.hash?.toHexString() == lxmHashHex }
+            }
         return if (pending) getOutboundPropagationCost() else null
     }
 
@@ -3542,19 +3563,38 @@ class LXMRouter(
             }
 
             var cancelledAny = false
+            val toNotify = mutableListOf<LXMessage>()
             pendingOutboundMutex.withLock {
                 for (message in pendingOutbound) {
                     if (message.hash?.toHexString() == messageIdHex || messageIdHex.isEmpty()) {
                         message.state = cancelState
                         cancelledAny = true
                         println("[LXMRouter] Cancelling ${message.hash?.toHexString()?.take(12)} in outbound queue")
+                        // Python cancel_outbound: cancel the in-flight resource
+                        // representation so the transfer actually stops
+                        // (otherwise it keeps sending and the completion
+                        // callback overwrites CANCELLED with SENT/DELIVERED).
+                        if (message.representation == MessageRepresentation.RESOURCE) {
+                            message.hash?.toHexString()?.let {
+                                pendingResources.remove(it)?.second?.cancel()
+                            }
+                        }
                     }
                 }
                 if (cancelledAny) {
+                    toNotify += pendingOutbound.filter { it.state == cancelState }
                     pendingOutbound.removeAll { it.state == cancelState }
                 }
             }
-            if (cancelledAny) processOutbound()
+            if (cancelledAny) {
+                // Notify callers outside the queue lock (Python calls
+                // process_outbound after cancelling, which surfaces the
+                // state to registered callbacks).
+                for (message in toNotify) {
+                    message.failedCallback?.invoke(message)
+                }
+                processOutbound()
+            }
         } catch (e: Exception) {
             println("[LXMRouter] An error occurred while cancelling $messageIdHex: ${e.message}")
         }
@@ -3621,6 +3661,12 @@ class LXMRouter(
     fun cancelPropagationNodeRequests() {
         outboundPropagationLink?.teardown()
         outboundPropagationLink = null
+        // Clear the pending path target so an in-flight path-wait job
+        // (requestMessagesPathJob) exits instead of starting the download
+        // once the path resolves. Python cancel_propagation_node_requests
+        // calls acknowledge_sync_completion(reset_state=True) which nulls
+        // wants_download_on_path_available_from.
+        wantsDownloadOnPathAvailableFrom = null
         propagationTransferState = PropagationTransferState.IDLE
         propagationTransferProgress = 0.0
     }
@@ -3673,11 +3719,13 @@ class LXMRouter(
      * Deviation documented in port-deviations.md.
      */
     fun registerExitHandler() {
-        Runtime.getRuntime().addShutdownHook(
+        if (exitHook != null) return
+        val hook =
             Thread {
                 runCatching { stop() }
-            },
-        )
+            }
+        Runtime.getRuntime().addShutdownHook(hook)
+        exitHook = hook
     }
 
     // ===== Cleanup Jobs (Phase 6) =====
