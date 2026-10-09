@@ -98,6 +98,14 @@ object LXMFConstants {
     /** Debug field for testing */
     const val FIELD_DEBUG = 0xFF
 
+    // ===== Supported Functionality (announce app_data) =====
+    // Values in the 3rd element of the delivery-announce app_data
+    // ([display_name, stamp_cost, supported_functionality]). See LXMF.py
+    // SF_COMPRESSION.
+
+    /** Peer supports compression of message content */
+    const val SF_COMPRESSION = 0x00
+
     // ===== Audio Modes for FIELD_AUDIO =====
 
     // Codec2 Audio Modes
@@ -254,10 +262,14 @@ object LXMFConstants {
     const val LXMF_OVERHEAD = 2 * DESTINATION_LENGTH + SIGNATURE_LENGTH + TIMESTAMP_SIZE + STRUCT_OVERHEAD
 
     /**
-     * Maximum content for encrypted single-packet message (295 bytes).
-     * Calculated as: encrypted MDU - LXMF overhead + destination hash (inferred)
+     * Maximum content for encrypted single-packet message (287 bytes).
+     * Calculated as: encrypted MDU - LXMF overhead + destination hash (inferred).
+     * With default RNS parameters (ENCRYPTED_PACKET_MDU = 383) and LXMF
+     * overhead of 112 bytes, plus the inferred 16-byte destination hash:
+     * 383 - 112 + 16 = 287. Mirrors Python `ENCRYPTED_PACKET_MAX_CONTENT`
+     * (LXMessage.py:79). If a message is larger, an RNS link is used.
      */
-    const val ENCRYPTED_PACKET_MAX_CONTENT = 295
+    const val ENCRYPTED_PACKET_MAX_CONTENT = 287
 
     /**
      * Maximum content for link-based single-packet message (319 bytes).
@@ -300,7 +312,7 @@ object LXMFConstants {
 
     // ===== Encryption Descriptions =====
 
-    const val ENCRYPTION_DESCRIPTION_AES = "AES-128"
+    const val ENCRYPTION_DESCRIPTION_AES = "AES-256"
     const val ENCRYPTION_DESCRIPTION_EC = "Curve25519"
     const val ENCRYPTION_DESCRIPTION_UNENCRYPTED = "Unencrypted"
 

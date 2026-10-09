@@ -5,6 +5,7 @@ import network.reticulum.Reticulum
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
+import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.Interface
@@ -893,6 +894,91 @@ private fun cmdLxmfShutdown(params: JSONObject): JSONObject {
 }
 
 // ----------------------------------------------------------------------
+// Deterministic inbound injection (conformance stamp capture)
+// ----------------------------------------------------------------------
+
+/**
+ * Drive a crafted UNSTAMPED inbound message through this node's
+ * production delivery path and report whether it reached the inbox.
+ *
+ * This is the Kotlin counterpart of the reference `lxmf_python.py
+ * cmd_lxmf_inject_inbound` bridge command used by
+ * `tests/test_stamp_enforcement_default.py` in lxmf-conformance. It pins
+ * the inbound stamp-enforcement default: the bridge's own delivery
+ * destination is given a stamp cost (so inbound messages are *subject* to
+ * stamp validation), stamp enforcement is left at its implementation
+ * default, and an unstamped message is fed to the production delivery
+ * entry point. The Python reference default is `enforce_stamps=False`, so
+ * the message reaches the inbox and `delivered` is `true`; an impl that
+ * drops an invalid-stamp message by default returns `delivered: false`.
+ *
+ * Params: `stamp_cost` (int, [1,254], default 4), `title` (str),
+ * `content` (str). A fresh random source hash is used per call so the
+ * message hash is unique and the dedup path can never swallow it.
+ *
+ * Result: `delivered` (bool, the delivery-path return value),
+ * `message_hash` (hex), `inbox_count` (int, current inbox size).
+ */
+private fun cmdLxmfInjectInbound(params: JSONObject): JSONObject {
+    val router = ensureRouter("lxmf_inject_inbound")
+    val dest = BridgeState.deliveryDestination
+        ?: throw IllegalStateException("lxmf_inject_inbound requires lxmf_init to have registered a delivery destination")
+
+    val stampCost = params.optInt("stamp_cost", 4)
+    if (stampCost !in 1..254) {
+        throw IllegalArgumentException("stamp_cost must be in [1,254]; got $stampCost")
+    }
+
+    val title = params.optString("title", "inject").toByteArray(Charsets.UTF_8)
+    val content = params.optString("content", "inject-inbound-test").toByteArray(Charsets.UTF_8)
+
+    // Engage the stamp gate by setting this bridge's own delivery
+    // destination's required stamp cost via the router's public API (the
+    // raw RNS Destination does not carry stampCost; it lives on the
+    // router's DeliveryDestination, keyed by hexHash). This is the field
+    // lxmfDelivery reads to decide whether to validate a stamp at all
+    // (requiredCost != null).
+    router.setInboundStampCost(dest.hash.toHexString(), stampCost)
+
+    // Assemble raw LXMF bytes: dest(16) + source(16) + signature(64) +
+    // payload. Payload is a 4-element msgpack array (double ts, bin
+    // title, bin content, empty-map fields) with NO stamp element. Source
+    // is a fresh random hash (unknown to this router); signature validity
+    // is not a delivery gate here (an unknown source maps to
+    // SOURCE_UNKNOWN, which is allowed), only the stamp is.
+    val destHash = dest.hash
+    val sourceHash = ByteArray(16).apply { java.security.SecureRandom().nextBytes(this) }
+    val signature = ByteArray(64)
+    val packed = java.io.ByteArrayOutputStream()
+    val packer = org.msgpack.core.MessagePack.newDefaultPacker(packed)
+    packer.packArrayHeader(4)
+    packer.packDouble(System.currentTimeMillis() / 1000.0)
+    // title + content are msgpack BIN (python packb(bytes) emits bin8
+    // 0xc4), not STR - kt unpackFromBytes reads them via
+    // unpackBinaryHeader.
+    packer.packBinaryHeader(title.size)
+    packer.writePayload(title)
+    packer.packBinaryHeader(content.size)
+    packer.writePayload(content)
+    packer.packMapHeader(0)
+    packer.close()
+    val payload = packed.toByteArray()
+
+    val lxmfBytes = destHash + sourceHash + signature + payload
+    val delivered = router.lxmfDelivery(lxmfBytes)
+
+    val messageHash = Hashes.fullHash(destHash + sourceHash + payload).toHexString()
+
+    val inboxCount: Int
+    BridgeState.inboxLock.withLock { inboxCount = BridgeState.inbox.size }
+
+    return JSONObject()
+        .put("delivered", delivered)
+        .put("message_hash", messageHash)
+        .put("inbox_count", inboxCount)
+}
+
+// ----------------------------------------------------------------------
 // Dispatch
 // ----------------------------------------------------------------------
 
@@ -912,6 +998,7 @@ private val COMMANDS: Map<String, (JSONObject) -> JSONObject> = mapOf(
     "lxmf_get_message_state" to ::cmdLxmfGetMessageState,
     "lxmf_get_message_progress" to ::cmdLxmfGetMessageProgress,
     "lxmf_decode_bytes" to ::cmdLxmfDecodeBytes,
+    "lxmf_inject_inbound" to ::cmdLxmfInjectInbound,
     "lxmf_shutdown" to ::cmdLxmfShutdown,
 )
 

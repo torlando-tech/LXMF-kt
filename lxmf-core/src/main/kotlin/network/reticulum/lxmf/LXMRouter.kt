@@ -289,6 +289,18 @@ class LXMRouter(
     /** Whether authentication is required for message delivery */
     private var authRequired: Boolean = false
 
+    /**
+     * Whether to drop inbound messages with an invalid stamp when the
+     * destination has a stamp cost set.
+     *
+     * Defaults to `false` to match the Python reference
+     * (`LXMRouter.py` `_enforce_stamps = False`). With the default, an
+     * invalid-stamp message is still delivered ("allowing anyway, since
+     * stamp enforcement is disabled"). Call [enforceStamps] to make such
+     * messages get dropped instead.
+     */
+    private var _enforceStamps: Boolean = false
+
     // ===== Cleanup Tracking =====
 
     /** Processing loop counter for scheduling periodic cleanup */
@@ -1535,14 +1547,14 @@ class LXMRouter(
         destination: Destination? = null,
         link: Link? = null,
         sourcePacket: Packet? = null,
-    ) {
+    ): Boolean {
         println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
 
         // Enforce incoming message size limit
         val limitKb = incomingMessageSizeLimitKb
         if (limitKb != null && data.size > limitKb * 1024) {
             println("[LXMRouter] Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit")
-            return
+            return false
         }
 
         try {
@@ -1563,12 +1575,12 @@ class LXMRouter(
                         destHash + decryptedData
                     } else {
                         println("[LXMRouter] Failed to decrypt propagated message for $destHashHex")
-                        return
+                        return false
                     }
                 } else {
                     // Not addressed to us — shouldn't happen in normal flow
                     println("[LXMRouter] Propagated message not for us: $destHashHex")
-                    return
+                    return false
                 }
             } else {
                 data
@@ -1578,7 +1590,7 @@ class LXMRouter(
             val message = LXMessage.unpackFromBytes(lxmfData, method)
             if (message == null) {
                 println("[LXMRouter] Failed to unpack LXMF message")
-                return
+                return false
             }
             println("[LXMRouter] Unpacked message from ${message.sourceHash.toHexString()}")
 
@@ -1601,7 +1613,7 @@ class LXMRouter(
             val dedupKey = message.hash?.toHexString()
             if (dedupKey != null && locallyDeliveredTransientIds.containsKey(dedupKey)) {
                 println("Duplicate message detected, ignoring")
-                return
+                return false
             }
 
             // Validate signature if possible
@@ -1613,7 +1625,7 @@ class LXMRouter(
                     }
                     UnverifiedReason.SIGNATURE_INVALID -> {
                         println("Message signature invalid, rejecting")
-                        return
+                        return false
                     }
                     null -> {
                         // No error, signature validated
@@ -1625,7 +1637,7 @@ class LXMRouter(
             val sourceHashHexForCheck = message.sourceHash.toHexString()
             if (ignoredList.any { it.toHexString() == sourceHashHexForCheck }) {
                 println("[LXMRouter] Ignored message from $sourceHashHexForCheck")
-                return
+                return false
             }
 
             // Validate stamp if required (PAPER messages bypass stamp enforcement)
@@ -1641,9 +1653,11 @@ class LXMRouter(
                 if (!message.validateStamp(requiredCost, tickets)) {
                     if (noStampEnforcement) {
                         println("[LXMRouter] Message from $sourceHashHexForCheck has invalid stamp, but allowing (PAPER delivery)")
+                    } else if (_enforceStamps) {
+                        println("[LXMRouter] Dropping message from $sourceHashHexForCheck with invalid stamp (required cost: $requiredCost, enforcement enabled)")
+                        return false
                     } else {
-                        println("[LXMRouter] Message from $sourceHashHexForCheck failed stamp validation (required cost: $requiredCost)")
-                        return
+                        println("[LXMRouter] Message from $sourceHashHexForCheck has invalid stamp, but allowing anyway, since stamp enforcement is disabled")
                     }
                 }
             }
@@ -1752,10 +1766,34 @@ class LXMRouter(
 
             // Invoke delivery callback
             deliveryCallback?.invoke(message)
+            return true
         } catch (e: Exception) {
             println("Error processing inbound delivery: ${e.message}")
+            return false
         }
     }
+
+    /**
+     * Drive a raw inbound LXMF byte sequence through the production
+     * delivery path. Public entry point mirroring the Python reference
+     * `LXMRouter.lxmf_delivery` (LXMRouter.py:1906), used by the
+     * conformance bridge to exercise the real stamp-validation /
+     * delivery gates without a live peer on the wire.
+     *
+     * @return `true` iff the message passed every gate and reached the
+     *   delivery callback; `false` if it was dropped at any stage
+     *   (unpack, dedup, signature, access control, or an invalid stamp
+     *   under [enforceStamps]).
+     *
+     * @param lxmfData raw LXMF bytes (dest + source + signature + payload).
+     * @param method delivery method; defaults to DIRECT. PAPER bypasses
+     *   stamp enforcement, so do not pass PAPER when the goal is to
+     *   exercise the stamp gate.
+     */
+    fun lxmfDelivery(
+        lxmfData: ByteArray,
+        method: DeliveryMethod = DeliveryMethod.DIRECT,
+    ): Boolean = processInboundDelivery(lxmfData, method)
 
     // ===== Announce Handling =====
 
@@ -1771,7 +1809,12 @@ class LXMRouter(
             org.msgpack.core.MessagePack
                 .newDefaultPacker(buffer)
 
-        packer.packArrayHeader(2)
+        // v0.5.0+ announce shape: [display_name, stamp_cost,
+        // supported_functionality]. The third element is itself a list of
+        // supported-functionality bits (LXMF.py get_announce_app_data /
+        // peer_data[2]; the receiver checks `SF_COMPRESSION in
+        // peer_data[2]`). Mirrors the Python reference exactly.
+        packer.packArrayHeader(3)
 
         // Display name
         if (displayName != null) {
@@ -1788,6 +1831,11 @@ class LXMRouter(
         } else {
             packer.packNil()
         }
+
+        // Supported functionality: advertise compression support (the only
+        // functionality bit currently in use), as a 1-element list.
+        packer.packArrayHeader(1)
+        packer.packInt(LXMFConstants.SF_COMPRESSION)
 
         packer.close()
         return buffer.toByteArray()
@@ -3178,6 +3226,32 @@ class LXMRouter(
     fun unignoreDestination(destinationHash: ByteArray) {
         ignoredList.removeAll { it.contentEquals(destinationHash) }
     }
+
+    /**
+     * Enable strict stamp enforcement: inbound messages with an invalid
+     * stamp (when the destination advertises a stamp cost) are dropped
+     * instead of delivered.
+     *
+     * Mirrors `LXMRouter.enforce_stamps()` (Python reference).
+     */
+    fun enforceStamps() {
+        _enforceStamps = true
+    }
+
+    /**
+     * Disable strict stamp enforcement (the default): inbound messages
+     * with an invalid stamp are still delivered.
+     *
+     * Mirrors `LXMRouter.ignore_stamps()` (Python reference).
+     */
+    fun ignoreStamps() {
+        _enforceStamps = false
+    }
+
+    /**
+     * Whether strict stamp enforcement is currently enabled.
+     */
+    fun isEnforcingStamps(): Boolean = _enforceStamps
 
     /**
      * Add a destination hash to the prioritised list.

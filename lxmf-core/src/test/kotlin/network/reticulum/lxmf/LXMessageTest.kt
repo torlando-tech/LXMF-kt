@@ -20,7 +20,10 @@ class LXMessageTest {
         assertEquals(16, LXMFConstants.DESTINATION_LENGTH)
         assertEquals(64, LXMFConstants.SIGNATURE_LENGTH)
         assertEquals(112, LXMFConstants.LXMF_OVERHEAD)
-        assertEquals(295, LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)
+        // 287 matches Python (LINK_MAX_CONTENT - ENCRYPTED_OVERHEAD for
+        // AES-256). A previous kt-only value of 295 assumed AES-128 and
+        // overstated the content budget.
+        assertEquals(287, LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)
         assertEquals(319, LXMFConstants.LINK_PACKET_MAX_CONTENT)
 
         // Field identifiers

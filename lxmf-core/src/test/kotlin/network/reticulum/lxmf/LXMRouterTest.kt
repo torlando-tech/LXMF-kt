@@ -16,6 +16,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -1295,6 +1296,74 @@ class LXMRouterTest {
                 "stamp via getStamp() and include it in the wire bytes via " +
                 "repackWithStamp() — otherwise enforce_stamps()-enabled " +
                 "receivers will drop the message.",
+        )
+    }
+
+    /**
+     * Regression net for the stamp-enforcement default (parity with Python
+     * LXMF: `_enforce_stamps` defaults to False, so invalid/unstamped
+     * messages are accepted until `enforceStamps()` is called).
+     *
+     * Mirrors the conformance `lxmf_inject_inbound` bridge command: build
+     * raw unstamped wire bytes addressed to the router's own registered
+     * delivery destination (which carries a required stamp cost), and drive
+     * the real production `lxmfDelivery` path. The source is a fresh random
+     * hash (unknown to this router), so the signature maps to
+     * SOURCE_UNKNOWN (allowed); only the stamp is in question.
+     */
+    @Test
+    fun `unstamped message is accepted by default and dropped once stamps are enforced`() {
+        val dest = router.registerDeliveryIdentity(identity, "StampGateTest")
+
+        // Engage the stamp gate: set this delivery destination's required
+        // cost via the public API (keyed by hexHash). The message below is
+        // unstamped, so validateStamp() returns false and the gate must
+        // decide on _enforceStamps alone.
+        router.setInboundStampCost(dest.hexHash, 4)
+
+        // Assemble raw unstamped LXMF wire bytes: dest(16) + source(16) +
+        // signature(64) + payload. Payload is a 4-element msgpack array
+        // (double ts, bin title, bin content, empty-map fields) with NO
+        // stamp element, matching the conformance bridge command. Each
+        // call uses a fresh random source hash so the message hash is
+        // unique and the dedup path (locallyDeliveredTransientIds) can
+        // never swallow it - that way the assertion below genuinely
+        // reaches the stamp gate rather than short-circuiting on dedup.
+        val destHash = dest.hash
+        val makeUnstampedBytes = {
+            val sourceHash = ByteArray(16).apply { java.security.SecureRandom().nextBytes(this) }
+            val signature = ByteArray(64)
+            val packed = java.io.ByteArrayOutputStream()
+            val packer = org.msgpack.core.MessagePack.newDefaultPacker(packed)
+            packer.packArrayHeader(4)
+            packer.packDouble(System.currentTimeMillis() / 1000.0)
+            packer.packBinaryHeader("stamp-gate".toByteArray(Charsets.UTF_8).size)
+            packer.writePayload("stamp-gate".toByteArray(Charsets.UTF_8))
+            packer.packBinaryHeader("content".toByteArray(Charsets.UTF_8).size)
+            packer.writePayload("content".toByteArray(Charsets.UTF_8))
+            packer.packMapHeader(0)
+            packer.close()
+            destHash + sourceHash + signature + packed.toByteArray()
+        }
+
+        // Default: stamp enforcement disabled -> an unstamped message is
+        // allowed through (returns true).
+        assertTrue(
+            router.lxmfDelivery(makeUnstampedBytes()),
+            "With stamp enforcement disabled (the Python-default parity), an " +
+                "unstamped message addressed to a stamp-cost destination must " +
+                "be delivered, not dropped.",
+        )
+
+        // Once enforcement is enabled, a FRESH unstamped message must be
+        // dropped at the stamp gate (returns false).
+        router.enforceStamps()
+        assertTrue(router.isEnforcingStamps())
+        assertFalse(
+            router.lxmfDelivery(makeUnstampedBytes()),
+            "Once enforceStamps() is called, an unstamped message must be " +
+                "dropped at the stamp gate (returns false), matching Python " +
+                "enforce_stamps().",
         )
     }
 }
